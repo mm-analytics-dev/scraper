@@ -36,7 +36,7 @@ BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
 
 # ----------------- Nastavenia -----------------
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/zilinsky-kraj/predaj"
-MAX_PAGES = 2
+MAX_PAGES = 100
 REQ_TIMEOUT = 25
 PAUSE = (1.5, 4.0)
 VERBOSE = True
