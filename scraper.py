@@ -6,12 +6,12 @@ Real-estate scraper -> BigQuery (+ voliteľne Excel)
 • Denný "snapshot" sa appenduje do BQ, "master" sa vždy nahrádza (replace).
 • Konfigurácia cez ENV premenné:
 
-  SAVE_EXCEL   = "true" | "false"   (default true)
-  BQ_ENABLE    = "true" | "false"   (default true)
-  GCP_PROJECT_ID = <tvoj_gcp_project>  (povinné, ak BQ_ENABLE=true)
-  BQ_DATASET     = "realestate"     (default)
-  BQ_LOCATION    = "EU"             (default; maj rovnaké ako dataset)
-  WORKSPACE_HOME = cesta pre xlsx   (default ".")
+  SAVE_EXCEL       = "true" | "false"   (default true)
+  BQ_ENABLE        = "true" | "false"   (default true)
+  GCP_PROJECT_ID   = <tvoj_gcp_project>  (povinné, ak BQ_ENABLE=true)
+  BQ_DATASET       = "realestate"       (default)
+  BQ_LOCATION      = "EU"               (default)
+  WORKSPACE_HOME   = cesta pre xlsx     (default ".")
 
 V GitHub Actions sa kľúč service accountu dáva do súboru a ukáže sa cez
 GOOGLE_APPLICATION_CREDENTIALS=<cesta_k_súboru>.
@@ -35,8 +35,6 @@ BQ_DATASET     = os.getenv("BQ_DATASET", "realestate")
 BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
 
 # ----------------- Nastavenia -----------------
-# TIP: ak chceš len Liptovský Mikuláš (okres), použi:
-# BASE_URL = "https://www.nehnutelnosti.sk/vysledky/liptovsky-mikulas/predaj"
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/zilinsky-kraj/predaj"
 MAX_PAGES = 2
 REQ_TIMEOUT = 25
@@ -47,10 +45,8 @@ PROGRESS_EVERY = 1
 TS = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 TODAY = date.today()
 
-# Pre Databricks sa používa Workspace cesta; inde zober aktuálny priečinok
 WORKSPACE_HOME = os.getenv("WORKSPACE_HOME", ".").rstrip("/")
 
-# Pevné názvy/umiestnenia súborov (mimo pôvodného nehnutelnosti_output/)
 BASE_NAME     = "nehnutelnosti_zilinsky_kraj"
 MASTER_XLSX   = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_master.xlsx")
 SNAPSHOT_DIR  = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_snapshots")
@@ -140,8 +136,6 @@ def extract_detail_links(html: str, page_url: str) -> list:
         for a in soup.find_all("a", href=True):
             if "/detail/" in a["href"]:
                 links.add(urljoin(page_url, a["href"]))
-
-    # niektoré duplicity majú # alebo parametre – normalizuj
     links = {l.split("#")[0] for l in links}
     return sorted(links)
 
@@ -240,7 +234,7 @@ def id_from_detail_url(u: str):
     m = ID_FROM_URL_RE.search(u)
     return m.group(1) if m else None
 
-# --------- Normalizácia / kanonizácia a NaN/Inf-safe ---------
+# --------- Normalizácia ---------
 def normalize_note(note: str):
     if not note: return None
     n = str(note).strip().lower()
@@ -306,7 +300,7 @@ def sanitize_history(hist) -> list:
             out.append(sanitize_event(dict(ev)))
         except Exception:
             continue
-    # zreťaz duplicitných stavov
+    # dedup po stave
     dedup = []
     for ev in out:
         key = (ev.get("status"), ev.get("price_eur"), ev.get("price_note"))
@@ -314,7 +308,7 @@ def sanitize_history(hist) -> list:
             dedup.append(ev)
     return dedup
 
-# --------- Typ nehnuteľnosti z listu/detailu ---------
+# --------- Typ nehnuteľnosti ---------
 def best_type_match(texts):
     hay = " | ".join([t for t in texts if t])[:20000].lower()
     found = None
@@ -331,7 +325,7 @@ def extract_types_from_list(html: str, page_url: str) -> dict:
         if "/detail/" not in href:
             continue
         abs_url = urljoin(page_url, href)
-        # nájdi rodičovský "card" element
+        # nájdi rodičovský “card” element
         card = a
         for _ in range(6):
             if card is None:
@@ -407,7 +401,6 @@ def load_master_xlsx(path: str) -> pd.DataFrame:
                 df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
         if "price_changes_count" in df.columns:
             df["price_changes_count"] = pd.to_numeric(df["price_changes_count"], errors="coerce").fillna(0).astype(int)
-        # sane historické price_history
         if "price_history" in df.columns:
             fixed = []
             for _, r in df.iterrows():
@@ -417,8 +410,9 @@ def load_master_xlsx(path: str) -> pd.DataFrame:
         return df[cols]
     return pd.DataFrame(columns=cols)
 
+# <<< changed: PK už nebude podľa listing_id, ale URL
 def make_pk(row: dict) -> str:
-    return row.get("listing_id") or row.get("url")
+    return row.get("url")
 
 def finalize_days(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
@@ -431,10 +425,10 @@ def finalize_days(df: pd.DataFrame) -> pd.DataFrame:
 def save_excel(df: pd.DataFrame, path: str):
     try: df.to_excel(path, index=False, engine="openpyxl")
     except Exception as e:
-        print(f"[WARN] Excel zápis zlyhal ({e}). Skús `%pip install openpyxl` a spustiť znova.", flush=True)
+        print(f"[WARN] Excel zápis zlyhal ({e}).", flush=True)
         raise
 
-# ----------------- História cien (NaN-safe, kanonizácia) -----------------
+# ----------------- História cien -----------------
 def load_history_from_cell(cell) -> list:
     if cell is None: return []
     try:
@@ -464,11 +458,9 @@ def _state_key(d):
     )
 
 def append_history_if_changed(row_dict, today_state: dict):
-    # načítaj a vyčisti históriu
     hist_raw = load_history_from_cell(row_dict.get("price_history"))
     hist = sanitize_history(hist_raw)
 
-    # vyčisti dnešný stav
     today_state = sanitize_event(today_state)
 
     changed = False
@@ -494,7 +486,6 @@ def append_history_if_changed(row_dict, today_state: dict):
 
     row_dict["price_status"] = today_state["status"]
     row_dict["price_changes_count"] = max(0, len(hist) - 1)
-    # dôležité: ukladáme už sanitizovaný list (bez NaN/Inf)
     row_dict["price_history"] = json.dumps(hist, ensure_ascii=False, allow_nan=False)
     return row_dict
 
@@ -552,7 +543,7 @@ def parse_detail(session: requests.Session, url: str, type_hint: str = None) -> 
     prop_type = type_hint or property_type_from_detail(soup)
 
     return {
-        "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scraped_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # UTC string, neskôr konvertované na TIMESTAMP
         "listing_id": listing_id,
         "url": url,
         "title": title,
@@ -686,7 +677,6 @@ def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame):
 
     print("[BQ] Upload hotový.")
 
-
 # ----------------- Hlavný crawler -----------------
 def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES):
     s = new_session()
@@ -745,7 +735,8 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES):
         "street_or_locality","city","district","rooms","area_m2","condition"
     ])
     if not df_today.empty:
-        df_today["pk"] = df_today.apply(lambda r: make_pk(r), axis=1)
+        # <<< changed: PK = URL a deduplikácia podľa URL
+        df_today["pk"] = df_today["url"]
         df_today = df_today.dropna(subset=["pk"]).drop_duplicates(subset=["pk"], keep="first")
 
     # načítaj a priprav master
