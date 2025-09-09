@@ -565,41 +565,127 @@ def parse_detail(session: requests.Session, url: str, type_hint: str = None) -> 
     }
 
 # ----------------- BigQuery upload -----------------
-def upload_to_bigquery(df_master: pd.DataFrame, df_today: pd.DataFrame):
-    """
-    MASTER -> replace (WRITE_TRUNCATE)
-    DAILY  -> append (s pridaným stĺpcom batch_ts)
-    """
-    if not BQ_ENABLE:
+def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame):
+    """Upload master (replace) + daily snapshot (append) do BigQuery s explicitnou schémou a fixnými dtype."""
+    if os.getenv("BQ_ENABLE", "false").lower() != "true":
+        print("[BQ] Upload preskočený (BQ_ENABLE != true).")
         return
-    if not GCP_PROJECT_ID:
-        raise RuntimeError("Missing GCP_PROJECT_ID env var (required for BigQuery upload)")
+
+    project_id = os.environ["GCP_PROJECT_ID"]
+    dataset = os.environ["BQ_DATASET"]
+    location = os.getenv("BQ_LOCATION", "EU")
+
+    def prep_master(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        df = df.copy()
+
+        # ---- STRING stĺpce
+        str_cols = [
+            "pk","listing_id","url","title","address","price_source","price_note",
+            "property_type","street_or_locality","city","district","condition",
+            "price_status","price_history"
+        ]
+        for c in str_cols:
+            if c in df.columns:
+                df[c] = df[c].astype("string").where(df[c].notna(), None)
+
+        # ---- INT stĺpce (nullable)
+        int_cols = ["price_eur","rooms","days_listed","price_changes_count","price_first_eur"]
+        for c in int_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+        # ---- FLOAT
+        if "area_m2" in df.columns:
+            df["area_m2"] = pd.to_numeric(df["area_m2"], errors="coerce")
+
+        # ---- BOOL
+        if "active" in df.columns:
+            df["active"] = df["active"].astype("boolean")
+
+        # ---- DATE stĺpce
+        date_cols = ["first_seen","last_seen","price_first_date","price_last_change_date","inactive_since"]
+        for c in date_cols:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
+
+        # ---- TIMESTAMP
+        if "scraped_at" in df.columns:
+            df["scraped_at"] = pd.to_datetime(df["scraped_at"], errors="coerce", utc=True)
+
+        return df
+
+    def prep_daily(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        df = prep_master(df).copy()
+        df["batch_ts"] = pd.Timestamp.utcnow()  # TIMESTAMP
+        return df
+
+    m = prep_master(master)
+    d = prep_daily(df_today)
+
+    # ---- Explicitná schéma pre BigQuery
+    master_schema = [
+        {"name":"pk","type":"STRING"},
+        {"name":"listing_id","type":"STRING"},
+        {"name":"url","type":"STRING"},
+        {"name":"title","type":"STRING"},
+        {"name":"address","type":"STRING"},
+        {"name":"price_eur","type":"INT64"},
+        {"name":"price_source","type":"STRING"},
+        {"name":"price_note","type":"STRING"},
+        {"name":"property_type","type":"STRING"},
+        {"name":"street_or_locality","type":"STRING"},
+        {"name":"city","type":"STRING"},
+        {"name":"district","type":"STRING"},
+        {"name":"rooms","type":"INT64"},
+        {"name":"area_m2","type":"FLOAT64"},
+        {"name":"condition","type":"STRING"},
+        {"name":"first_seen","type":"DATE"},
+        {"name":"last_seen","type":"DATE"},
+        {"name":"active","type":"BOOL"},
+        {"name":"days_listed","type":"INT64"},
+        {"name":"scraped_at","type":"TIMESTAMP"},
+        {"name":"price_first_eur","type":"INT64"},
+        {"name":"price_first_note","type":"STRING"},
+        {"name":"price_first_date","type":"DATE"},
+        {"name":"price_last_change_date","type":"DATE"},
+        {"name":"price_changes_count","type":"INT64"},
+        {"name":"price_status","type":"STRING"},
+        {"name":"price_history","type":"STRING"},
+        {"name":"inactive_since","type":"DATE"},
+    ]
+    daily_schema = master_schema + [{"name":"batch_ts","type":"TIMESTAMP"}]
 
     import pandas_gbq
 
-    df_daily = df_today.copy()
-    if not df_daily.empty:
-        df_daily["batch_ts"] = pd.Timestamp.utcnow()
+    # master: WRITE_TRUNCATE (replace)
+    pandas_gbq.to_gbq(
+        m,
+        f"{dataset}.listings_master",
+        project_id=project_id,
+        if_exists="replace",
+        table_schema=master_schema,
+        location=location,
+        progress_bar=False,
+    )
 
-    # replace master (schéma/partition ostáva)
-    if not df_master.empty:
+    # daily: APPEND
+    if d is not None and not d.empty:
         pandas_gbq.to_gbq(
-            df_master,
-            f"{BQ_DATASET}.listings_master",
-            project_id=GCP_PROJECT_ID,
-            if_exists="replace",
-            location=BQ_LOCATION
-        )
-
-    # append daily
-    if not df_daily.empty:
-        pandas_gbq.to_gbq(
-            df_daily,
-            f"{BQ_DATASET}.listings_daily",
-            project_id=GCP_PROJECT_ID,
+            d,
+            f"{dataset}.listings_daily",
+            project_id=project_id,
             if_exists="append",
-            location=BQ_LOCATION
+            table_schema=daily_schema,
+            location=location,
+            progress_bar=False,
         )
+
+    print("[BQ] Upload hotový.")
+
 
 # ----------------- Hlavný crawler -----------------
 def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES):
