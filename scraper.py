@@ -38,7 +38,7 @@ BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
 # TIP: ak chceš len Liptovský Mikuláš (okres), použi:
 # BASE_URL = "https://www.nehnutelnosti.sk/vysledky/liptovsky-mikulas/predaj"
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/zilinsky-kraj/predaj"
-MAX_PAGES = 50
+MAX_PAGES = 2
 REQ_TIMEOUT = 25
 PAUSE = (1.5, 4.0)
 VERBOSE = True
