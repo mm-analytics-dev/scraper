@@ -1,0 +1,34 @@
+name: Daily scrape to BigQuery
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 01:00 UTC (~03:00 v lete / 02:00 v zime)
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: daily-scrape
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - name: Write service account key
+        run: echo "$GCP_SA_KEY" > sa.json
+        env: { GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }} }
+
+      - name: Run scraper -> BigQuery
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          BQ_LOCATION: ${{ secrets.BQ_LOCATION || 'EU' }}
+          BQ_ENABLE: "true"
+          SAVE_EXCEL: "false"
+          WORKSPACE_HOME: ${{ github.workspace }}
+        run: python scraper.py
