@@ -27,7 +27,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
-          BQ_LOCATION: ${{ secrets.BQ_LOCATION || 'EU' }}
+          BQ_LOCATION: EU
           BQ_ENABLE: "true"
           SAVE_EXCEL: "false"
           WORKSPACE_HOME: ${{ github.workspace }}
