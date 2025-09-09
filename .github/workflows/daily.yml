@@ -2,7 +2,7 @@ name: Daily scrape to BigQuery
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # 01:00 UTC (~03:00 v lete / 02:00 v zime)
+    - cron: '0 1 * * *'   # 01:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -13,14 +13,18 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+
       - run: pip install -r requirements.txt
 
       - name: Write service account key
+        shell: bash
         run: echo "$GCP_SA_KEY" > sa.json
-        env: { GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }} }
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
       - name: Run scraper -> BigQuery
         env:
