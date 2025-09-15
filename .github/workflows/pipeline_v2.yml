@@ -14,6 +14,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -21,7 +22,8 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 pandas openpyxl pandas-gbq google-cloud-bigquery pyarrow db-dtypes
+          pip install requests beautifulsoup4 pandas openpyxl \
+                      pandas-gbq google-cloud-bigquery pyarrow db-dtypes
 
       - name: Write service account key
         shell: bash
@@ -29,19 +31,17 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
-      # VARIANT A: spúšťame existujúci scraper.py (nie scraper_meta.py)
-      - name: Run scraper.py (META)
+      # TU sa spúšťa nový scraper
+      - name: Run scraper_meta.py (META v2)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # preferuj nový dataset V2, inak padni na pôvodný
           BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           BQ_ENABLE: ${{ secrets.BQ_ENABLE || 'true' }}
           SAVE_EXCEL: ${{ secrets.SAVE_EXCEL || 'false' }}
           WORKSPACE_HOME: ${{ github.workspace }}
-          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-        run: python scraper.py
+        run: python scraper_meta.py
 
   gps-collector:
     name: 2) GPS collector → BQ
@@ -52,6 +52,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -73,7 +74,6 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # zapisuj rovno do V2
           BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
         run: python gps_collector.py
@@ -87,6 +87,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -94,7 +95,8 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas pandas-gbq google-cloud-bigquery google-cloud-storage pyarrow db-dtypes
+          pip install requests pandas pandas-gbq google-cloud-bigquery \
+                      google-cloud-storage pyarrow db-dtypes
 
       - name: Write service account key
         shell: bash
@@ -106,7 +108,6 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # zapisuj do V2
           BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
