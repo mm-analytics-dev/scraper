@@ -1,318 +1,300 @@
 # -*- coding: utf-8 -*-
-"""
-Image downloader job (v2)
-- Source: BigQuery table with {listing_id, url[, seq_global]}
-- Target: GCS bucket (prefix images_v2/YYYYMMDD/<listing_id>/)
-- Log:   BigQuery table <dataset>.images_downloaded_daily
-
-Env vars (set in GitHub Actions):
-  GOOGLE_APPLICATION_CREDENTIALS  -> path to SA json
-  GCP_PROJECT_ID                  -> GCP project
-  BQ_DATASET                      -> fallback dataset name
-  BQ_DATASET_V2                   -> preferred dataset v2 (if set)
-  BQ_LOCATION                     -> e.g. EU
-  GCS_BUCKET                      -> destination bucket
-
-Optional envs:
-  MAX_IMAGES                      -> int limit for testing
-  HTTP_TIMEOUT                    -> default 25
-  MIN_BYTES                       -> default 3_000  (skip tiny pixels)
-  MAX_BYTES                       -> default 15_000_000 (15MB)
-
-Expected source table names (first that exists will be used):
-  images_urls_daily
-  images_urls_v2
-  image_urls_daily
-  image_urls_v2
-"""
-
 import os
 import re
 import sys
 import time
+import uuid
 import json
 import random
-import logging
-import hashlib
-from datetime import datetime, date
+from datetime import datetime, timezone, date
+from urllib.parse import urlparse
 
-import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from google.cloud import bigquery
 from google.cloud import storage
 from google.api_core.exceptions import NotFound, Conflict
 
-# ------------- Config & utils -------------
-PROJECT   = os.environ.get("GCP_PROJECT_ID") or ""
-DATASET   = os.environ.get("BQ_DATASET_V2") or os.environ.get("BQ_DATASET") or "realestate_v2"
-LOCATION  = os.environ.get("BQ_LOCATION") or "EU"
-BUCKET    = os.environ.get("GCS_BUCKET") or ""
-RUN_ID    = os.environ.get("GITHUB_RUN_ID") or datetime.utcnow().strftime("%Y%m%d%H%M%S")
-TODAY     = date.today().strftime("%Y%m%d")
+# ---------------- Env & constants ----------------
 
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "25"))
-MIN_BYTES    = int(os.environ.get("MIN_BYTES", "3000"))
-MAX_BYTES    = int(os.environ.get("MAX_BYTES", str(15_000_000)))
-MAX_IMAGES   = int(os.environ.get("MAX_IMAGES", "0"))  # 0 = no limit
+PROJECT_ID   = os.environ.get("GCP_PROJECT_ID") or ""
+BQ_DATASET   = os.environ.get("BQ_DATASET") or ""  # napr. realestate_v2
+BQ_LOCATION  = os.environ.get("BQ_LOCATION") or "EU"
+GCS_BUCKET   = os.environ.get("GCS_BUCKET") or ""  # napr. realestate-images-eu
+BATCH_LIMIT  = int(os.environ.get("BATCH_LIMIT", "100"))
 
-SRC_TABLE_CANDIDATES = [
-    "images_urls_daily",
-    "images_urls_v2",
-    "image_urls_daily",
-    "image_urls_v2",
+TABLE_STAGING = f"{PROJECT_ID}.{BQ_DATASET}.image_urls_staging"
+TABLE_IMAGES  = f"{PROJECT_ID}.{BQ_DATASET}.images"
+
+TODAY = date.today()
+DAYSTR = TODAY.strftime("%Y%m%d")
+PREFIX_ROOT = f"images_v2/{DAYSTR}"
+
+UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
 
-# minimal logger
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("img-dl")
+IMG_SUFFIX_ALLOW = (".jpg", ".jpeg", ".webp", ".png", ".avif", ".jfif", ".gif")
+IMG_BAD_HINTS = ("data:image/", "beacon", "pixel", "ads", "analytics")
 
-IMG_SUFFIX_ALLOW = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".jfif")
-BAD_HINTS = ("pixel", "beacon", "ads", "analytics")
-ACCEPT_HDR = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
 
-def guess_ext(url: str, content_type: str | None) -> str:
-    u = (url or "").lower()
-    for suf in IMG_SUFFIX_ALLOW:
-        if u.endswith(suf):
-            return suf
-    if not content_type:
-        return ".jpg"
-    ct = content_type.lower()
-    if "jpeg" in ct:
-        return ".jpg"
-    if "png" in ct:
-        return ".png"
-    if "webp" in ct:
-        return ".webp"
-    if "avif" in ct:
-        return ".avif"
-    if "gif" in ct:
-        return ".gif"
-    return ".jpg"
+def log(msg: str):
+    print(msg, flush=True)
 
-def is_probably_bad(url: str) -> bool:
-    u = (url or "").lower()
-    if any(b in u for b in BAD_HINTS):
-        return True
-    return False
 
-def pick_source_table(bq: bigquery.Client) -> str:
-    for name in SRC_TABLE_CANDIDATES:
-        tbl = f"{PROJECT}.{DATASET}.{name}"
-        try:
-            bq.get_table(tbl)
-            log.info(f"Using source table: {tbl}")
-            return name
-        except NotFound:
-            continue
-    raise RuntimeError(
-        f"No source table found in {PROJECT}.{DATASET}. "
-        f"Tried: {', '.join(SRC_TABLE_CANDIDATES)}"
+def fail_if_missing():
+    missing = []
+    if not PROJECT_ID:  missing.append("GCP_PROJECT_ID")
+    if not BQ_DATASET:  missing.append("BQ_DATASET")
+    if not GCS_BUCKET:  missing.append("GCS_BUCKET")
+    if missing:
+        raise SystemExit(f"Missing env vars: {', '.join(missing)}")
+
+
+# ---------------- HTTP session ----------------
+
+def new_session():
+    s = requests.Session()
+    retry = Retry(
+        total=4, connect=3, read=3, backoff_factor=1.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
     )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
-def ensure_log_table(bq: bigquery.Client, table_id: str):
-    schema = [
-        bigquery.SchemaField("run_id", "STRING"),
-        bigquery.SchemaField("uploaded_at", "TIMESTAMP"),
-        bigquery.SchemaField("listing_id", "STRING"),
-        bigquery.SchemaField("url", "STRING"),
-        bigquery.SchemaField("gcs_path", "STRING"),
-        bigquery.SchemaField("status", "STRING"),
-        bigquery.SchemaField("http_status", "INT64"),
-        bigquery.SchemaField("bytes", "INT64"),
-        bigquery.SchemaField("content_type", "STRING"),
-        bigquery.SchemaField("sha1", "STRING"),
-    ]
-    table_ref = bigquery.Table(table_id, schema=schema)
+
+def fetch_image(session: requests.Session, url: str) -> tuple[bytes, str]:
+    """
+    Return (content, content_type) or (None, reason)
+    """
+    if not url or any(b in url.lower() for b in IMG_BAD_HINTS):
+        return None, "bad_url"
+
+    headers = {
+        "User-Agent": random.choice(UAS),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://www.nehnutelnosti.sk/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    r = session.get(url, headers=headers, timeout=25)
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if r.status_code != 200:
+        return None, f"http_{r.status_code}"
+    if not ct.startswith("image/"):
+        return None, f"not_image:{ct or 'unknown'}"
+
+    content = r.content or b""
+    if len(content) < 3000:  # pár kilobajtov býva často HTML/placeholder
+        return None, "too_small"
+
+    return content, ct
+
+
+# ---------------- BQ helpers ----------------
+
+def ensure_tables(bq: bigquery.Client):
+    """
+    Vytvorí tabuľky, ak neexistujú.
+    - image_urls_staging: {seq_global INT64, listing_id STRING, image_url STRING, source_url STRING, created_at TIMESTAMP}
+    - images: {seq_global INT64, listing_id STRING, image_url STRING, gcs_uri STRING, content_type STRING, size_bytes INT64, downloaded_at TIMESTAMP}
+    """
+    # staging
     try:
-        bq.get_table(table_id)
+        bq.get_table(TABLE_STAGING)
     except NotFound:
-        log.info(f"Creating log table {table_id}")
-        bq.create_table(table_ref)
-    except Exception as e:
-        raise
+        schema = [
+            bigquery.SchemaField("seq_global", "INTEGER"),
+            bigquery.SchemaField("listing_id", "STRING"),
+            bigquery.SchemaField("image_url", "STRING"),
+            bigquery.SchemaField("source_url", "STRING"),
+            bigquery.SchemaField("created_at", "TIMESTAMP"),
+        ]
+        table = bigquery.Table(TABLE_STAGING, schema=schema)
+        table.time_partitioning = bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="created_at")
+        bq.create_table(table)
+        log(f"Created table {TABLE_STAGING}")
 
-# ------------- Main downloader -------------
-def main():
-    if not PROJECT or not BUCKET:
-        log.error("Missing GCP_PROJECT_ID or GCS_BUCKET env.")
-        sys.exit(2)
+    # images
+    try:
+        bq.get_table(TABLE_IMAGES)
+    except NotFound:
+        schema = [
+            bigquery.SchemaField("seq_global", "INTEGER"),
+            bigquery.SchemaField("listing_id", "STRING"),
+            bigquery.SchemaField("image_url", "STRING"),
+            bigquery.SchemaField("gcs_uri", "STRING"),
+            bigquery.SchemaField("content_type", "STRING"),
+            bigquery.SchemaField("size_bytes", "INTEGER"),
+            bigquery.SchemaField("downloaded_at", "TIMESTAMP"),
+        ]
+        table = bigquery.Table(TABLE_IMAGES, schema=schema)
+        bq.create_table(table)
+        log(f"Created table {TABLE_IMAGES}")
 
-    bq = bigquery.Client(project=PROJECT, location=LOCATION)
-    gcs = storage.Client(project=PROJECT)
-    bucket = gcs.bucket(BUCKET)
 
-    src_table = pick_source_table(bq)
-
+def fetch_batch_urls(bq: bigquery.Client, limit: int) -> list[dict]:
+    """
+    Vezme len URL, ktoré:
+      - sú v stagingu
+      - ešte nie sú v tabuľke images (podľa image_url)
+    """
     sql = f"""
     SELECT
-      CAST(listing_id AS STRING) AS listing_id,
-      CAST(url AS STRING)         AS url,
-      CAST(seq_global AS INT64)   AS seq_global
-    FROM `{PROJECT}.{DATASET}.{src_table}`
-    WHERE url IS NOT NULL AND url != ''
+      s.seq_global,
+      s.listing_id,
+      s.image_url
+    FROM `{TABLE_STAGING}` AS s
+    LEFT JOIN `{TABLE_IMAGES}` AS i
+      ON s.image_url = i.image_url
+    WHERE i.image_url IS NULL
+    GROUP BY s.seq_global, s.listing_id, s.image_url
+    LIMIT @limit
     """
-    df = bq.query(sql).result().to_dataframe(create_bqstorage_client=True)
-    if df.empty:
-        log.info("No image urls found, exiting.")
+    job = bq.query(sql, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("limit", "INT64", limit)],
+        location=BQ_LOCATION,
+    ))
+    rows = list(job.result())
+    return [dict(r) for r in rows]
+
+
+def insert_images_rows(bq: bigquery.Client, rows: list[dict]):
+    if not rows:
+        return
+    errors = bq.insert_rows_json(TABLE_IMAGES, rows)
+    if errors:
+        # zaloguj, ale neskolabuj – idempotentné
+        log(f"[WARN] BQ insert errors: {errors}")
+
+
+# ---------------- GCS helpers ----------------
+
+CT2EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/avif": ".avif",
+}
+
+def guess_ext(ct: str, url: str) -> str:
+    ct = (ct or "").split(";")[0].strip().lower()
+    if ct in CT2EXT:
+        return CT2EXT[ct]
+    # fallback podľa URL
+    path = urlparse(url).path.lower()
+    for suf in IMG_SUFFIX_ALLOW:
+        if path.endswith(suf):
+            return suf
+    return ".jpg"
+
+
+def next_index_for_listing(sto: storage.Client, bucket_name: str, prefix: str) -> int:
+    """
+    Zistí, koľko objektov už pod prefixom je a vráti ďalší index (1-based).
+    """
+    bucket = sto.bucket(bucket_name)
+    blobs = list(sto.list_blobs(bucket, prefix=prefix))
+    return len([b for b in blobs if b.name and re.search(r"/\d{3}\.", b.name)]) + 1
+
+
+def upload_image(sto: storage.Client, bucket_name: str, object_name: str, content: bytes, content_type: str) -> str:
+    bucket = sto.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    blob.upload_from_string(content, content_type=content_type)
+    return f"gs://{bucket_name}/{object_name}"
+
+
+# ---------------- Main logic ----------------
+
+def main():
+    fail_if_missing()
+
+    bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+    sto = storage.Client(project=PROJECT_ID)
+
+    ensure_tables(bq)
+
+    batch = fetch_batch_urls(bq, BATCH_LIMIT)
+    if not batch:
+        log("No new image URLs to download. Done.")
         return
 
-    # Drop obvious bads & NaNs
-    df = df.dropna(subset=["listing_id", "url"])
-    df = df[~df["url"].str.contains(r"^data:image", na=False)]
-    df = df[~df["url"].apply(is_probably_bad)]
+    log(f"Downloading up to {len(batch)} images...")
 
-    # Index per listing for deterministic file names
-    df["img_idx"] = df.groupby("listing_id").cumcount() + 1
+    s = new_session()
+    ok_rows = []
+    done = 0
+    skipped = 0
+    failed = 0
 
-    if MAX_IMAGES and MAX_IMAGES > 0:
-        df = df.head(MAX_IMAGES)
+    for row in batch:
+        seq = row.get("seq_global")
+        listing_id = (row.get("listing_id") or "").strip() or None
+        img_url = (row.get("image_url") or "").strip()
 
-    # Prepare log table
-    log_table = f"{PROJECT}.{DATASET}.images_downloaded_daily"
-    ensure_log_table(bq, log_table)
-
-    s = requests.Session()
-    s.headers.update({
-        "Accept": ACCEPT_HDR,
-        "User-Agent": "Mozilla/5.0 (img-downloader/2.0; +github-actions)"
-    })
-
-    records = []
-    processed = 0
-
-    for r in df.itertuples(index=False):
-        listing_id = str(r.listing_id or "NA")
-        url        = str(r.url or "")
-        idx        = int(getattr(r, "img_idx", 1))
-
-        if not url or url.startswith("data:"):
+        if not img_url:
+            skipped += 1
             continue
 
-        # GCS path: images_v2/YYYYMMDD/<listing_id>/<idx>.<ext>
-        # Keep it stable per day; if exists -> skip
-        subdir = f"images_v2/{TODAY}/{listing_id}"
-        # Temporary ext guess, final after response
-        ext_hint = guess_ext(url, None)
-        object_name = f"{subdir}/{idx:03d}{ext_hint}"
-
-        blob = bucket.blob(object_name)
-        if blob.exists():
-            log.debug(f"SKIP exists: gs://{BUCKET}/{object_name}")
-            records.append({
-                "run_id": RUN_ID,
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "listing_id": listing_id,
-                "url": url,
-                "gcs_path": f"gs://{BUCKET}/{object_name}",
-                "status": "exists",
-                "http_status": 0,
-                "bytes": int(blob.size or 0),
-                "content_type": blob.content_type or None,
-                "sha1": None,
-            })
+        # 1) stiahni
+        content, ct = fetch_image(s, img_url)
+        if content is None:
+            failed += 1
+            log(f"[SKIP] {img_url} ({ct})")
             continue
 
+        # 2) vytvor objekt path
+        folder_id = listing_id if listing_id else str(seq or "NA")
+        prefix_listing = f"{PREFIX_ROOT}/{folder_id}/"
+        idx = next_index_for_listing(sto, GCS_BUCKET, prefix_listing)
+        ext = guess_ext(ct, img_url)
+        object_name = f"{prefix_listing}{idx:03d}{ext}"
+
+        # 3) upload s content-type
         try:
-            resp = s.get(url, stream=True, timeout=HTTP_TIMEOUT)
-            http_status = resp.status_code
-            if http_status != 200:
-                log.warning(f"HTTP {http_status} -> {url}")
-                records.append({
-                    "run_id": RUN_ID,
-                    "uploaded_at": datetime.utcnow().isoformat(),
-                    "listing_id": listing_id,
-                    "url": url,
-                    "gcs_path": None,
-                    "status": "http_error",
-                    "http_status": http_status,
-                    "bytes": None,
-                    "content_type": None,
-                    "sha1": None,
-                })
-                continue
-
-            # Read up to MAX_BYTES
-            content = resp.content
-            ctype = resp.headers.get("Content-Type", "")
-            size = len(content)
-            if size < MIN_BYTES or size > MAX_BYTES:
-                log.warning(f"Size out of range ({size} B) -> {url}")
-                records.append({
-                    "run_id": RUN_ID,
-                    "uploaded_at": datetime.utcnow().isoformat(),
-                    "listing_id": listing_id,
-                    "url": url,
-                    "gcs_path": None,
-                    "status": "bad_size",
-                    "http_status": http_status,
-                    "bytes": size,
-                    "content_type": ctype,
-                    "sha1": None,
-                })
-                continue
-
-            # Correct ext by content-type if needed
-            ext_final = guess_ext(url, ctype)
-            if not object_name.endswith(ext_final):
-                object_name = f"{subdir}/{idx:03d}{ext_final}"
-                blob = bucket.blob(object_name)
-
-            sha1 = hashlib.sha1(content).hexdigest()
-
-            # Upload
-            blob.upload_from_string(content, content_type=ctype or "application/octet-stream")
-            log.info(f"UPLOADED gs://{BUCKET}/{object_name} ({size/1024:.1f} KB)")
-
-            records.append({
-                "run_id": RUN_ID,
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "listing_id": listing_id,
-                "url": url,
-                "gcs_path": f"gs://{BUCKET}/{object_name}",
-                "status": "uploaded",
-                "http_status": http_status,
-                "bytes": size,
-                "content_type": ctype,
-                "sha1": sha1,
-            })
-
+            gcs_uri = upload_image(sto, GCS_BUCKET, object_name, content, ct)
         except Exception as e:
-            log.error(f"Download/upload error: {e} | url={url}")
-            records.append({
-                "run_id": RUN_ID,
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "listing_id": listing_id,
-                "url": url,
-                "gcs_path": None,
-                "status": "error",
-                "http_status": None,
-                "bytes": None,
-                "content_type": None,
-                "sha1": None,
-            })
+            failed += 1
+            log(f"[ERR] upload {img_url} -> {e}")
+            continue
 
-        processed += 1
-        # gentle pacing
-        time.sleep(random.uniform(0.15, 0.4))
+        # 4) zapíš metadáta do BQ
+        ok_rows.append({
+            "seq_global": int(seq) if seq is not None else None,
+            "listing_id": listing_id,
+            "image_url": img_url,
+            "gcs_uri": gcs_uri,
+            "content_type": ct,
+            "size_bytes": len(content),
+            "downloaded_at": datetime.now(timezone.utc).isoformat(),
+        })
+        done += 1
+        # mierny backoff aby sme boli slušní
+        time.sleep(0.2)
 
-    if not records:
-        log.info("Nothing processed.")
-        return
+    # flush BQ inserts
+    insert_images_rows(bq, ok_rows)
 
-    # Write log to BQ
-    out_df = pd.DataFrame.from_records(records)
-    job_cfg = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
-    job = bq.load_table_from_dataframe(out_df, log_table, job_config=job_cfg)
-    job.result()
+    log(f"Finished. downloaded={done}, skipped={skipped}, failed={failed}")
+    if done:
+        log(f"Example GCS prefix: gs://{GCS_BUCKET}/{PREFIX_ROOT}/")
 
-    log.info(f"Finished. Processed={processed}, uploaded={sum(r['status']=='uploaded' for r in records)}, "
-             f"exists={sum(r['status']=='exists' for r in records)}")
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        main()
+    except Exception as e:
+        log(f"[FATAL] {e}")
+        sys.exit(1)
