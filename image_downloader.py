@@ -15,7 +15,7 @@ from urllib3.util.retry import Retry
 
 from google.cloud import bigquery
 from google.cloud import storage
-from google.api_core.exceptions import NotFound, Conflict
+from google.api_core.exceptions import NotFound
 
 # ---------------- Env & constants ----------------
 
@@ -71,7 +71,7 @@ def new_session():
     return s
 
 
-def fetch_image(session: requests.Session, url: str) -> tuple[bytes, str]:
+def fetch_image(session: requests.Session, url: str) -> tuple[bytes, str] | tuple[None, str]:
     """
     Return (content, content_type) or (None, reason)
     """
@@ -94,7 +94,7 @@ def fetch_image(session: requests.Session, url: str) -> tuple[bytes, str]:
         return None, f"not_image:{ct or 'unknown'}"
 
     content = r.content or b""
-    if len(content) < 3000:  # pár kilobajtov býva často HTML/placeholder
+    if len(content) < 3000:
         return None, "too_small"
 
     return content, ct
@@ -160,10 +160,11 @@ def fetch_batch_urls(bq: bigquery.Client, limit: int) -> list[dict]:
     GROUP BY s.seq_global, s.listing_id, s.image_url
     LIMIT @limit
     """
-    job = bq.query(sql, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("limit", "INT64", limit)],
-        location=BQ_LOCATION,
-    ))
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("limit", "INT64", limit)]
+    )
+    # >>> location patrí do client.query(...), nie do QueryJobConfig
+    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)
     rows = list(job.result())
     return [dict(r) for r in rows]
 
@@ -173,7 +174,6 @@ def insert_images_rows(bq: bigquery.Client, rows: list[dict]):
         return
     errors = bq.insert_rows_json(TABLE_IMAGES, rows)
     if errors:
-        # zaloguj, ale neskolabuj – idempotentné
         log(f"[WARN] BQ insert errors: {errors}")
 
 
@@ -192,7 +192,6 @@ def guess_ext(ct: str, url: str) -> str:
     ct = (ct or "").split(";")[0].strip().lower()
     if ct in CT2EXT:
         return CT2EXT[ct]
-    # fallback podľa URL
     path = urlparse(url).path.lower()
     for suf in IMG_SUFFIX_ALLOW:
         if path.endswith(suf):
@@ -201,9 +200,6 @@ def guess_ext(ct: str, url: str) -> str:
 
 
 def next_index_for_listing(sto: storage.Client, bucket_name: str, prefix: str) -> int:
-    """
-    Zistí, koľko objektov už pod prefixom je a vráti ďalší index (1-based).
-    """
     bucket = sto.bucket(bucket_name)
     blobs = list(sto.list_blobs(bucket, prefix=prefix))
     return len([b for b in blobs if b.name and re.search(r"/\d{3}\.", b.name)]) + 1
@@ -221,7 +217,7 @@ def upload_image(sto: storage.Client, bucket_name: str, object_name: str, conten
 def main():
     fail_if_missing()
 
-    bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+    bq = bigquery.Client(project=PROJECT_ID)
     sto = storage.Client(project=PROJECT_ID)
 
     ensure_tables(bq)
@@ -248,21 +244,18 @@ def main():
             skipped += 1
             continue
 
-        # 1) stiahni
         content, ct = fetch_image(s, img_url)
         if content is None:
             failed += 1
             log(f"[SKIP] {img_url} ({ct})")
             continue
 
-        # 2) vytvor objekt path
         folder_id = listing_id if listing_id else str(seq or "NA")
         prefix_listing = f"{PREFIX_ROOT}/{folder_id}/"
         idx = next_index_for_listing(sto, GCS_BUCKET, prefix_listing)
         ext = guess_ext(ct, img_url)
         object_name = f"{prefix_listing}{idx:03d}{ext}"
 
-        # 3) upload s content-type
         try:
             gcs_uri = upload_image(sto, GCS_BUCKET, object_name, content, ct)
         except Exception as e:
@@ -270,7 +263,6 @@ def main():
             log(f"[ERR] upload {img_url} -> {e}")
             continue
 
-        # 4) zapíš metadáta do BQ
         ok_rows.append({
             "seq_global": int(seq) if seq is not None else None,
             "listing_id": listing_id,
@@ -281,10 +273,8 @@ def main():
             "downloaded_at": datetime.now(timezone.utc).isoformat(),
         })
         done += 1
-        # mierny backoff aby sme boli slušní
         time.sleep(0.2)
 
-    # flush BQ inserts
     insert_images_rows(bq, ok_rows)
 
     log(f"Finished. downloaded={done}, skipped={skipped}, failed={failed}")
