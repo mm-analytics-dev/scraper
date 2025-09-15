@@ -44,8 +44,8 @@ BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
 # ----------------- Nastavenia -----------------
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj"
 
-MAX_PAGES = 2                 # koľko strán výsledkov prejsť
-MAX_LINKS_PER_PAGE = None     # maximum unikátnych inzerátov z 1 stránky
+MAX_PAGES = 1                # koľko strán výsledkov prejsť
+MAX_LINKS_PER_PAGE = 10     # maximum unikátnych inzerátov z 1 stránky
 MAX_LISTINGS_TOTAL = None     # celkový strop (None = bez limitu)
 
 REQ_TIMEOUT = 25
