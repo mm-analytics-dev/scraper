@@ -572,7 +572,7 @@ def normalize_features(pairs: dict):
         if "vlastníctvo" in low or "vlastnictvo" in low: norm["ownership"] = v
         if "terén" in low or "teren" in low: norm["terrain"] = v
         if "vykurovanie" in low: norm["heating"] = v
-        if "počet izieb" in low or "pocet izieb" in low or "miestností" v low:
+        if "počet izieb" in low or "pocet izieb" in low or "miestností" in low:
             m = re.search(r"\d+", v)
             if m: norm["rooms_count"] = int(m.group())
     for key in lab:
