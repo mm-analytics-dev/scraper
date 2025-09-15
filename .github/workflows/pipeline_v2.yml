@@ -14,7 +14,6 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -30,20 +29,19 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Run scraper_meta.py (META only)
+      # VARIANT A: spúšťame existujúci scraper.py (nie scraper_meta.py)
+      - name: Run scraper.py (META)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # nový dataset v2 (primárny cieľ)
-          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
-          # pôvodný dataset ponechaný ako fallback
-          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          # preferuj nový dataset V2, inak padni na pôvodný
+          BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           BQ_ENABLE: ${{ secrets.BQ_ENABLE || 'true' }}
           SAVE_EXCEL: ${{ secrets.SAVE_EXCEL || 'false' }}
           WORKSPACE_HOME: ${{ github.workspace }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-        run: python scraper_meta.py
+        run: python scraper.py
 
   gps-collector:
     name: 2) GPS collector → BQ
@@ -54,7 +52,6 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -76,10 +73,8 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # nový dataset v2 (GPS bude zapisovať do v2)
-          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
-          # fallback na pôvodný dataset (ak by kód ešte používal BQ_DATASET)
-          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          # zapisuj rovno do V2
+          BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
         run: python gps_collector.py
 
@@ -92,7 +87,6 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -112,10 +106,8 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # nový dataset v2 (ak bude skript niečo zapisovať do BQ)
-          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
-          # fallback na pôvodný dataset
-          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          # zapisuj do V2
+          BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
         run: python image_downloader.py
