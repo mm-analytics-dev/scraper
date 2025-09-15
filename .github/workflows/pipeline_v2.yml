@@ -14,22 +14,29 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas openpyxl pandas-gbq google-cloud-bigquery pyarrow db-dtypes
+
       - name: Write service account key
         shell: bash
         run: echo "$GCP_SA_KEY" > sa.json
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
       - name: Run scraper_meta.py (META only)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          # nový dataset v2 (primárny cieľ)
+          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
+          # pôvodný dataset ponechaný ako fallback
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           BQ_ENABLE: ${{ secrets.BQ_ENABLE || 'true' }}
@@ -47,24 +54,31 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install pandas pandas-gbq google-cloud-bigquery pyarrow db-dtypes
           pip install playwright
           python -m playwright install --with-deps chromium
+
       - name: Write service account key
         shell: bash
         run: echo "$GCP_SA_KEY" > sa.json
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
       - name: Run gps_collector.py
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          # nový dataset v2 (GPS bude zapisovať do v2)
+          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
+          # fallback na pôvodný dataset (ak by kód ešte používal BQ_DATASET)
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
         run: python gps_collector.py
@@ -78,25 +92,30 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas pandas-gbq google-cloud-bigquery google-cloud-storage pyarrow db-dtypes
+
       - name: Write service account key
         shell: bash
         run: echo "$GCP_SA_KEY" > sa.json
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+
       - name: Run image_downloader.py
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          # nový dataset v2 (ak bude skript niečo zapisovať do BQ)
+          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
+          # fallback na pôvodný dataset
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
         run: python image_downloader.py
-
-
