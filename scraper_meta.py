@@ -610,6 +610,166 @@ def append_history_if_changed(row_dict, today_state: dict):
     row_dict["price_history"] = json.dumps(hist, ensure_ascii=False, allow_nan=False)
     return row_dict
 
+# ----------------- VLASTNOSTI (EXTRAKCIA + NORMALIZÁCIA) -----------------
+
+def _num_from_text_m(text: str):
+    if not text: return None
+    # napr. "šírka 18 m", "18m", "18 m"
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*m\b", text.replace("\u00A0"," "), flags=re.I)
+    if not m:
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*$", text)  # fallback
+    if not m: return None
+    s = m.group(1).replace(",", ".")
+    try: return float(s)
+    except: return None
+
+def _num_from_text_m2(text: str):
+    if not text: return None
+    # "450 m2", "450 m²", "450m2"
+    m = re.search(r"(\d{1,3}(?:[ \u00A0\u202F.]?\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s*m(?:2|²)\b", text, flags=re.I)
+    if not m:
+        # niekedy len číslo bez jednotky
+        m = re.search(r"(\d{2,5})(?!\d)", text)
+    if not m: return None
+    s = m.group(1)
+    s = s.replace("\u00A0","").replace("\u202F","").replace(" ","").replace(".","").replace(",", ".")
+    try: return float(s)
+    except: return None
+
+def extract_features_pairs(soup: BeautifulSoup) -> list[dict]:
+    """
+    Vytiahne kľúč-hodnota páry z rôznych štruktúr (tabuľky, <dl>, zoznamy).
+    Výstup: [{"key": "...", "value": "..."}, ...]
+    """
+    pairs = []
+
+    def push(k, v):
+        k = clean_spaces(k or ""); v = clean_spaces(v or "")
+        if k and v:
+            pairs.append({"key": k, "value": v})
+
+    # Tabuľky <table>
+    for tbl in soup.find_all("table"):
+        for tr in tbl.find_all("tr"):
+            cells = tr.find_all(["th","td"])
+            if len(cells) >= 2:
+                k = cells[0].get_text(" ", strip=True)
+                v = cells[1].get_text(" ", strip=True)
+                push(k, v)
+
+    # Definičné zoznamy <dl><dt><dd>
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        for dt, dd in zip(dts, dds):
+            push(dt.get_text(" ", strip=True), dd.get_text(" ", strip=True))
+
+    # Zoznamy s dvojbodkou v texte
+    for li in soup.find_all("li"):
+        t = clean_spaces(li.get_text(" ", strip=True))
+        if ":" in t and 3 < len(t) <= 200:
+            k, v = t.split(":", 1)
+            push(k, v)
+
+    # Páry s "label/value" v divoch/spanoch
+    for row in soup.select("[class*='row'], [class*='item'], [class*='property'], [class*='attribute']"):
+        lbl = None; val = None
+        lab = row.find(attrs={"class": re.compile(r"(label|name|title)", re.I)})
+        if lab: lbl = lab.get_text(" ", strip=True)
+        valn = row.find(attrs={"class": re.compile(r"(value|data|content)", re.I)})
+        if valn: val = valn.get_text(" ", strip=True)
+        if lbl and val: push(lbl, val)
+
+    # Odstráň možné UI šumy
+    cleaned = []
+    for p in pairs:
+        k = norm_txt(p["key"])
+        if not k or any(bad in k for bad in ("kontakt","predavaj","inzer","map","cena za m")):
+            continue
+        cleaned.append(p)
+    return cleaned
+
+def normalize_features(pairs: list[dict]) -> dict:
+    """
+    Premapuje voľný text kľúčov na štandardizované polia + parsuje čísla.
+    """
+    out = {
+        "land_area_m2": None,
+        "builtup_area_m2": None,
+        "plot_width_m": None,
+        "orientation": None,
+        "ownership": None,
+        "terrain": None,
+        "water": None,
+        "electricity": None,
+        "gas": None,
+        "waste": None,
+        "heating": None,
+        "rooms_count": None,
+    }
+
+    def key_is(k: str, *needles):
+        nk = norm_txt(k)
+        return any(n in nk for n in needles)
+
+    for p in pairs:
+        k, v = p.get("key",""), p.get("value","")
+        nk = norm_txt(k)
+
+        # Plochy
+        if key_is(k, "vymera pozemku", "rozloha pozemku", "plocha pozemku", "pozemok", "celkova plocha pozemku"):
+            val = _num_from_text_m2(v)
+            if val: out["land_area_m2"] = val; continue
+
+        if key_is(k, "zastavana plocha"):
+            val = _num_from_text_m2(v)
+            if val: out["builtup_area_m2"] = val; continue
+
+        # niektorí uvádzajú úžitkovú/podlahovú plochu – to je skôr area_m2, ale ak builtup chýba, nedáme to sem
+        # ponecháme iba ako potenciálny doplnok v parse_detail, kde doplníme area_m2 ak chýba.
+
+        # Šírka pozemku
+        if key_is(k, "sirka pozemku", "sirka"):
+            val = _num_from_text_m(v)
+            if val: out["plot_width_m"] = val; continue
+
+        # Orientácia
+        if key_is(k, "orientacia"):
+            out["orientation"] = v; continue
+
+        # Vlastníctvo
+        if key_is(k, "vlastnictvo", "vlastnik"):
+            out["ownership"] = v; continue
+
+        # Terén
+        if key_is(k, "teren", "sklon"):
+            out["terrain"] = v; continue
+
+        # Inžinierske siete
+        if key_is(k, "voda", "pripojka vody", "vodovod"):
+            out["water"] = v; continue
+        if key_is(k, "elektrina", "elektro", "elektr"):
+            out["electricity"] = v; continue
+        if key_is(k, "plyn"):
+            out["gas"] = v; continue
+        if key_is(k, "kanalizacia", "odpad", "splask"):
+            out["waste"] = v; continue
+
+        # Kúrenie
+        if key_is(k, "kurenie", "vykurovanie"):
+            out["heating"] = v; continue
+
+        # Počet izieb (ak nebude v adrese)
+        if key_is(k, "pocet izieb", "izby", "izieb"):
+            m = re.search(r"\d+", v)
+            if m:
+                try: out["rooms_count"] = int(m.group(0))
+                except: pass
+            continue
+
+    # Vyčistenie None hodnôt (ponecháme None; BQ schema to zvládne)
+    return {k: v for k, v in out.items()}
+
 # ----------------- Detail parser -----------------
 
 def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint: str = None) -> dict:
@@ -676,6 +836,17 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
         s_norm = norm_txt(street)
         if s_norm in LM_OBCE_NORM or s_norm == norm_txt(obec):
             street = None
+
+    # Ak v „features“ existuje úžitková/podlahová plocha a chýba area_m2 z adresy → doplň
+    if addr_info.get("area_m2") is None:
+        # hľadaj "Úžitková plocha" alebo "Podlahová plocha" medzi pármi
+        for p in pairs:
+            nk = norm_txt(p.get("key",""))
+            if any(x in nk for x in ("uzitkova plocha", "podlahova plocha", "obyvarna plocha", "celkova podlahova plocha")):
+                val = _num_from_text_m2(p.get("value",""))
+                if val:
+                    addr_info["area_m2"] = val
+                    break
 
     return {
         # KEYS
