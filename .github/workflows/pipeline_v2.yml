@@ -108,7 +108,7 @@ jobs:
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
           # ---- limity natvrdo pre testovanie ----
           IMAGES_LOOKBACK_DAYS: '3'
-          IMAGES_MAX_LISTINGS: '10'
+          IMAGES_MAX_LISTINGS: '15'
           IMAGES_MAX_PER_LISTING: '60'
           # Jednorazovo necháš takto a potom vymažeš:
           # IMAGES_TABLE_RECREATE: 'true'
