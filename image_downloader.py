@@ -409,16 +409,30 @@ def ensure_pk_gcs_table(table_id: str):
         print(f"[BQ] Created table {table_id}.")
 
 def fetch_existing_pairs(table_id: str, pks: List[str]) -> Set[Tuple[str, str]]:
+    """
+    Bezpečne načíta existujúce dvojice (pk, gcs_url) pre dané PKs.
+    Používa parametrizovaný dotaz s UNNEST, žiadne ručné skladanie IN (...) reťazca.
+    """
     if not pks:
         return set()
-    qp = ",".join([f"'{pk.replace(\"'\", \"\\'\")}'" for pk in pks])
-    sql = f"SELECT pk, gcs_url FROM `{table_id}` WHERE pk IN ({qp})"
+
+    sql = f"""
+    SELECT pk, gcs_url
+    FROM `{table_id}`
+    WHERE pk IN UNNEST(@pks)
+    """
+
     try:
-        df = bq.query(sql, location=LOCATION or None).result().to_dataframe()
-        return set((str(r['pk']), str(r['gcs_url'])) for _, r in df.iterrows())
+        job_cfg = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("pks", "STRING", pks)]
+        )
+        df = bq.query(sql, job_config=job_cfg, location=LOCATION or None) \
+               .result().to_dataframe(create_bqstorage_client=False)
+        return set((str(r["pk"]), str(r["gcs_url"])) for _, r in df.iterrows())
     except Exception as e:
         print(f"[WARN] fetch_existing_pairs failed (ignored): {e}")
         return set()
+
 
 def insert_pk_gcs_rows(table_id: str, rows: List[Dict[str, Any]]):
     if not rows:
