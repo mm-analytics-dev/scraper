@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Images downloader (v5) -> GCS + BigQuery (PK -> GCS URL)
+Images downloader (v6) -> GCS + BigQuery (PK -> public HTTPS URL)
 
-Co robi:
-- Z {DATASET}.listings_master vezme inzeraty v lookback okne (IMAGES_LOOKBACK_DAYS),
-  max IMAGES_MAX_LISTINGS kusov.
-- Z detailu vyparsuje VSETKY rozumne image URL (og:image, JSON-LD, <img>, srcset, data-*) a odfiltruje duplicity.
-- Stiahne max IMAGES_MAX_PER_LISTING obrazkov na inzerat.
-- Ulozi do GCS: images_v2/YYYYMMDD/{SEQ}_{listing_id}/NNN.ext
-- Do BQ {DATASET}.{IMAGES_PK_GCS_TABLE} zapise kazdu fotku zvlast: (pk, gcs_url, downloaded_at, batch_date).
-- Idempotentne: preskoci existujuce GCS objekty + pred zapisom do BQ odfiltruje existujuce (pk, gcs_url).
-
-Skript si SAM DOINSTALUJE zalezitosti (beautifulsoup4, google-cloud-bigquery, google-cloud-storage, requests, pandas),
-aby v CI nikdy nepadal na ModuleNotFoundError.
+Čo robí:
+- Z {DATASET}.listings_master zoberie inzeráty (IMAGES_LOOKBACK_DAYS), max IMAGES_MAX_LISTINGS.
+- Z detailu vyparsuje VŠETKY rozumné image URL (og:image, JSON-LD, <img>, srcset, data-*).
+- Stiahne max IMAGES_MAX_PER_LISTING fotiek na inzerát.
+- Uloží do GCS: images_v2/YYYYMMDD/{SEQ}_{listing_id}/{NNN.ext}
+- Do BQ {DATASET}.{IMAGES_PK_GCS_TABLE} zapíše každý obrázok: (pk, gcs_url, downloaded_at, batch_date),
+  kde gcs_url je **verejná HTTPS URL**: https://storage.googleapis.com/<bucket>/<path>
+- Idempotentné: preskočí existujúce objekty v GCS + deduplikuje podľa (pk, HTTPS URL).
+- Kompatibilita: ak v tabuľke už sú riadky s `gs://...`, pri čítaní ich normalizuje na HTTPS,
+  takže sa berú ako rovnaké a nevzniknú duplicity.
 
 ENV:
   GOOGLE_APPLICATION_CREDENTIALS=./sa.json
@@ -31,31 +30,24 @@ ENV:
 import sys, subprocess
 
 def _ensure(pkg_name: str, import_name: str | None = None, min_version: str | None = None):
-    """
-    Ensure a package is importable; if not, pip install it.
-    """
-    mod = import_name or pkg_name
     try:
-        __import__(mod)
+        __import__(import_name or pkg_name)
         return
     except Exception:
         pass
     to_install = pkg_name + (f">={min_version}" if min_version else "")
     print(f"[DEPS] Installing {to_install} ...", flush=True)
-    # no --user (GHA runner allows system install in venv)
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", to_install])
 
-# minimal set
 _ensure("requests", "requests", "2.31.0")
 _ensure("urllib3", "urllib3", "2.2.0")
 _ensure("pandas", "pandas", "2.2.1")
 _ensure("beautifulsoup4", "bs4", "4.12.3")
 _ensure("google-cloud-bigquery", "google.cloud.bigquery", "3.25.0")
 _ensure("google-cloud-storage", "google.cloud.storage", "2.16.0")
-# auth lib sometimes missing
 _ensure("google-auth", "google.auth", "2.27.0")
 
-# ---------- IMPORTS (after ensuring) ----------
+# ---------- IMPORTS ----------
 import os
 import re
 import time
@@ -139,7 +131,30 @@ bq = bigquery.Client(project=PROJECT_ID or None, location=LOCATION or None)
 gcs = storage.Client(project=PROJECT_ID or None)
 bucket = gcs.bucket(BUCKET_NAME) if BUCKET_NAME else None
 
-# ---------- SQL: kandidati ----------
+# ---------- URL normalizácia ----------
+def https_url(bucket_name: str, path: str) -> str:
+    # základná public endpoint URL
+    return f"https://storage.googleapis.com/{bucket_name}/{path}"
+
+def to_https_canonical(u: str) -> str:
+    """
+    Normalizuj na HTTPS public URL:
+      gs://bucket/path -> https://storage.googleapis.com/bucket/path
+      https://storage.googleapis.com/bucket/path -> (ponechaj)
+      iné formy vráť nezmenené (nemali by byť)
+    """
+    if not u:
+        return u
+    if u.startswith("gs://"):
+        # gs://bucket/...
+        without = u[len("gs://"):]
+        parts = without.split("/", 1)
+        if len(parts) == 2:
+            bkt, pth = parts
+            return https_url(bkt, pth)
+    return u
+
+# ---------- SQL: kandidáti ----------
 SQL_CANDIDATES = """
 SELECT pk, listing_id, seq_global, url
 FROM `{{PROJECT_ID}}.{{DATASET}}.listings_master`
@@ -323,7 +338,7 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
 def ensure_pk_gcs_table(table_id: str):
     schema = [
         bigquery.SchemaField("pk", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("gcs_url", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("gcs_url", "STRING", mode="REQUIRED"),  # bude obsahovať HTTPS public URL
         bigquery.SchemaField("downloaded_at", "TIMESTAMP", mode="NULLABLE"),
         bigquery.SchemaField("batch_date", "DATE", mode="NULLABLE"),
     ]
@@ -335,6 +350,9 @@ def ensure_pk_gcs_table(table_id: str):
         print(f"[BQ] Created table {table_id}.")
 
 def fetch_existing_pairs(table_id: str, pks: List[str]) -> Set[Tuple[str, str]]:
+    """
+    Načíta existujúce (pk, gcs_url) a gcs_url normalizuje na HTTPS.
+    """
     if not pks:
         return set()
     sql = f"""
@@ -346,7 +364,12 @@ def fetch_existing_pairs(table_id: str, pks: List[str]) -> Set[Tuple[str, str]]:
     job_cfg = bigquery.QueryJobConfig(query_parameters=params)
     try:
         df = bq.query(sql, job_config=job_cfg, location=LOCATION or None).result().to_dataframe()
-        return set((str(r["pk"]), str(r["gcs_url"])) for _, r in df.iterrows())
+        out: Set[Tuple[str, str]] = set()
+        for _, r in df.iterrows():
+            pk = str(r["pk"])
+            url = str(r["gcs_url"])
+            out.add((pk, to_https_canonical(url)))
+        return out
     except Exception as e:
         print(f"[WARN] fetch_existing_pairs failed (ignored): {e}")
         return set()
@@ -381,7 +404,7 @@ def main():
     table_id = f"{PROJECT_ID}.{DATASET}.{IMAGES_PK_GCS_TABLE}"
     ensure_pk_gcs_table(table_id)
 
-    # prefetch existing pairs to dedup before insert
+    # existujúce páry, normalizované na HTTPS
     pk_list = cand["pk"].astype(str).tolist()
     existing_pairs = fetch_existing_pairs(table_id, pk_list)
 
@@ -407,13 +430,16 @@ def main():
                 print(f"[WARN] pk={pk} img#{i:03d} skip: {err or http_status}", flush=True)
                 continue
 
-            gcs_url = f"gs://{BUCKET_NAME}/{gcs_path}"
-            if (pk, gcs_url) in existing_pairs:
+            # Ukladaj HTTPS URL, nie gs://
+            https = https_url(BUCKET_NAME, gcs_path)
+            canon = to_https_canonical(https)
+
+            if (pk, canon) in existing_pairs:
                 continue
 
             out_records.append({
                 "pk": pk,
-                "gcs_url": gcs_url,
+                "gcs_url": canon,  # HTTPS
                 "downloaded_at": now_utc(),
                 "batch_date": pd.to_datetime(BATCH_YYYYMMDD, format="%Y%m%d"),
             })
@@ -424,10 +450,10 @@ def main():
         print("[INFO] Nothing downloaded/uploaded. Exiting.")
         return
 
-    # final dedup & insert
+    # finálna deduplikácia vs. aktuálny stav tabuľky
     pk_subset = sorted({rec["pk"] for rec in out_records})
     existing_pairs2 = fetch_existing_pairs(table_id, pk_subset)
-    final_rows = [rec for rec in out_records if (rec["pk"], rec["gcs_url"]) not in existing_pairs2]
+    final_rows = [rec for rec in out_records if (rec["pk"], to_https_canonical(rec["gcs_url"])) not in existing_pairs2]
 
     insert_pk_gcs_rows(table_id, final_rows)
 
