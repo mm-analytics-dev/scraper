@@ -1,27 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Real-estate scraper -> Excel (master + denné snapshoty) + obrázky (len URL) + popis + vlastnosti
+Real-estate scraper -> Excel (master + denné snapshoty) + popis + vlastnosti
 
-ÚPRAVA PRE v2 PIPELINE:
-- Tento súbor už **NEsťahuje obrázky**. Z detailu vyťaží len **URL** obrázkov.
-- Po behu zapíše do BigQuery (ak BQ_ENABLE=true):
-    - {BQ_DATASET}.listings_master      (REPLACE / WRITE_TRUNCATE)
-    - {BQ_DATASET}.listings_daily       (APPEND, iba dnešné videné)
-    - {BQ_DATASET}.images_urls_daily    (APPEND, staging URL obrázkov)
-- Excel export zostáva kvôli debugu (SAVE_EXCEL=true/false).
+ÚPRAVA:
+* ÚPLNE odstránené: akékoľvek zbieranie / staging URL obrázkov.
+* Garantovaná unikátnosť PK: aktualizácia záznamu podľa 'pk' + finálne drop_duplicates.
+* BigQuery: bez images_urls_daily; master (REPLACE), daily (APPEND).
 
 ENV premenné očakávané v GHA:
-  BQ_ENABLE=true|false            (default true)
-  GCP_PROJECT_ID=...
-  BQ_DATASET=realestate_v2        (alebo tvoj dataset pre v2)
-  BQ_LOCATION=EU
-  SAVE_EXCEL=true|false           (default false)
-  WORKSPACE_HOME=...              (iba pre xlsx debug)
-  GOOGLE_APPLICATION_CREDENTIALS=./sa.json (píše ho job z GitHub Secrets)
-
-Poznámka: kód je tvoja verzia s minimálnymi zásahmi — zmeny:
-  1) deterministická deduplikácia URL obrázkov (zachovanie poradia) kvôli stabilným rankom,
-  2) drobné kozmetické safe-guardy.
+BQ_ENABLE=true|false            (default true)
+GCP_PROJECT_ID=...
+BQ_DATASET=realestate_v2
+BQ_LOCATION=EU
+SAVE_EXCEL=true|false           (default false)
+WORKSPACE_HOME=...              (iba pre xlsx debug)
+GOOGLE_APPLICATION_CREDENTIALS=./sa.json (píše ho job z GitHub Secrets)
 """
 
 import os, re, time, json, random, math, unicodedata
@@ -35,18 +28,20 @@ from bs4 import BeautifulSoup
 import pandas as pd
 
 # ----------------- ENV / v2 BQ prepínače -----------------
-SAVE_EXCEL     = os.getenv("SAVE_EXCEL", "false").lower() == "true"
-BQ_ENABLE      = os.getenv("BQ_ENABLE", "true").lower() == "true"
-GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
-BQ_DATASET     = os.getenv("BQ_DATASET", "realestate_v2")
-BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
+
+SAVE_EXCEL      = os.getenv("SAVE_EXCEL", "false").lower() == "true"
+BQ_ENABLE       = os.getenv("BQ_ENABLE", "true").lower() == "true"
+GCP_PROJECT_ID  = os.getenv("GCP_PROJECT_ID", "")
+BQ_DATASET      = os.getenv("BQ_DATASET", "realestate_v2")
+BQ_LOCATION     = os.getenv("BQ_LOCATION", "EU")
 
 # ----------------- Nastavenia -----------------
+
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj"
 
-MAX_PAGES = 1                 # koľko strán výsledkov prejsť
-MAX_LINKS_PER_PAGE = 15       # maximum unikátnych inzerátov z 1 stránky
-MAX_LISTINGS_TOTAL = None     # celkový strop (None = bez limitu)
+MAX_PAGES = 1                  # koľko strán výsledkov prejsť
+MAX_LINKS_PER_PAGE = 15        # maximum unikátnych inzerátov z 1 stránky
+MAX_LISTINGS_TOTAL = None      # celkový strop (None = bez limitu)
 
 REQ_TIMEOUT = 25
 PAUSE = (1.3, 3.6)
@@ -61,15 +56,14 @@ BASE_NAME     = "nehnutelnosti_liptovsky_mikulas_okres"
 MASTER_XLSX   = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_master.xlsx")
 SNAPSHOT_DIR  = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_snapshots")
 DEBUG_DIR     = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_debug")
-IMAGES_DIR    = os.path.join(WORKSPACE_HOME, "inzeraty")  # legacy; nepoužíva sa
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
-os.makedirs(IMAGES_DIR, exist_ok=True)
 
 SNAPSHOT_XLSX = os.path.join(SNAPSHOT_DIR, f"{BASE_NAME}_{TS}.xlsx")
 
 # ----------------- Regexy a slovníky -----------------
+
 PRICE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:[ \u00A0\u202F.]?\d{3})+|\d+)\s*(?:€|EUR)(?!\S)", re.I)
 PER_SQM_HINT = re.compile(r"(?:€|EUR)\s*/\s*m|za\s*m2|m²", re.I)
 AD_PRICE_SANITIZE_RE = re.compile(r"\s+")
@@ -77,10 +71,6 @@ DETAIL_ABS_RE = re.compile(r"https?://www\.nehnutelnosti\.sk/detail/[^\s\"<>]+",
 ID_FROM_URL_RE = re.compile(r"/detail/([^/]+)/")
 ROOMS_RE = re.compile(r"(\d+)\s*[-\s]*izbov", re.I)
 AREA_RE  = re.compile(r"(\d{1,3}(?:[ \u00A0\u202F.]?\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s*m(?:2|²)\b", re.I)
-
-IMG_HOST_ALLOW = ("img.unitedclassifieds.sk", "img.nehnutelnosti.sk")
-IMG_SUFFIX_ALLOW = (".jpg", ".jpeg", ".webp", ".png", ".avif", ".jfif", ".gif")
-IMG_BAD_HINTS = ("data:image/", "beacon", "pixel", "ads", "analytics")
 
 CONDITION_KEYWORDS = [
     "Novostavba","Kompletná rekonštrukcia","Čiastočná rekonštrukcia",
@@ -98,8 +88,9 @@ KEY_POZEMOK = ("pozemok","pozemky","stavebný pozemok","stavebny pozemok","orná
 KEY_OBJEKT  = ("objekt","polyfunk", "administratív", "administrativ", "komerčný objekt","komercny objekt")
 
 # ----------------- Obce LM -----------------
+
 LM_OBCE = [
- "Liptovský Mikuláš","Liptovský Hrádok","Beňadiková","Bobrovček","Bobrovec","Bobrovník","Bukovina","Demänovská Dolina","Dúbrava","Galovany","Gôtovany","Huty","Hybe","Ižipovce","Jakubovany","Jalovec","Jamník","Konská","Kráľova Lehota","Kvačany","Lazisko","Liptovská Anna","Liptovská Kokava","Liptovská Porúbka","Liptovská Sielnica","Liptovské Beharovce","Liptovské Kľačany","Liptovské Matiašovce","Liptovský Ján","Liptovský Ondrej","Liptovský Peter","Liptovský Trnovec","Ľubeľa","Malatíny","Malé Borové","Malužiná","Nižná Boca","Partizánska Ľupča","Pavčina Lehota","Pavlova Ves","Podtureň","Pribylina","Prosiek","Smrečany","Svätý Kríž","Trstené","Uhorská Ves","Vavrišovo","Važec","Veľké Borové","Veterná Poruba","Vlachy","Východná","Vyšná Boca","Závažná Poruba","Žiar"
+    "Liptovský Mikuláš","Liptovský Hrádok","Beňadiková","Bobrovček","Bobrovec","Bobrovník","Bukovina","Demänovská Dolina","Dúbrava","Galovany","Gôtovany","Huty","Hybe","Ižipovce","Jakubovany","Jalovec","Jamník","Konská","Kráľova Lehota","Kvačany","Lazisko","Liptovská Anna","Liptovská Kokava","Liptovská Porúbka","Liptovská Sielnica","Liptovské Beharovce","Liptovské Kľačany","Liptovské Matiašovce","Liptovský Ján","Liptovský Ondrej","Liptovský Peter","Liptovský Trnovec","Ľubeľa","Malatíny","Malé Borové","Malužiná","Nižná Boca","Partizánska Ľupča","Pavčina Lehota","Pavlova Ves","Podtureň","Pribylina","Prosiek","Smrečany","Svätý Kríž","Trstené","Uhorská Ves","Vavrišovo","Važec","Veľké Borové","Veterná Poruba","Vlachy","Východná","Vyšná Boca","Závažná Poruba","Žiar"
 ]
 LM_OBCE_NORM = { unicodedata.normalize("NFKD", o).encode("ascii","ignore").decode().lower(): o for o in LM_OBCE }
 
@@ -111,7 +102,7 @@ def strip_diacritics(s: str) -> str:
 def norm_txt(s: str) -> str:
     if s is None: return ""
     s = strip_diacritics(s).lower()
-    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    s = re.sub(r"[^a-z0-9\s-]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -124,6 +115,7 @@ def most_specific_obec(*texts) -> str | None:
     return found
 
 # ----------------- HTTP -----------------
+
 UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
@@ -138,7 +130,7 @@ ACCEPT_LANGS = [
 def rand_headers(extra=None):
     h = {
         "User-Agent": random.choice(UAS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": random.choice(ACCEPT_LANGS),
         "Cache-Control": "no-cache", "Pragma": "no-cache",
         "Referer": "https://www.nehnutelnosti.sk/",
@@ -174,6 +166,7 @@ def save_debug(html: str, name: str):
     return path
 
 # ----------------- Linky (unikátne podľa listing_id) -----------------
+
 def extract_detail_links(html: str, page_url: str, limit: int | None) -> list:
     soup = BeautifulSoup(html, "html.parser")
     seen_ids = set()
@@ -199,11 +192,12 @@ def extract_detail_links(html: str, page_url: str, limit: int | None) -> list:
             if lid not in seen_ids:
                 seen_ids.add(lid)
                 unique_urls.append(abs_url)
-                if limit is not None and len(unique_urls) >= limit:
-                    break
+            if limit is not None and len(unique_urls) >= limit:
+                break
     return unique_urls
 
 # ----------------- Základné util -----------------
+
 def clean_spaces(s: str) -> str:
     return AD_PRICE_SANITIZE_RE.sub(" ", s or "").strip()
 
@@ -222,6 +216,7 @@ def _to_float_area(num_raw: str):
     return float(s.replace("\u00A0","").replace("\u202F","").replace(" ",""))
 
 # ----------------- Adresa → street_or_locality -----------------
+
 def extract_from_address(addr: str) -> dict:
     out = {"street_or_locality":None,"rooms":None,"area_m2":None,"condition":None}
     if not addr: return out
@@ -244,6 +239,7 @@ def extract_from_address(addr: str) -> dict:
     return out
 
 # ----------------- Cena -----------------
+
 def price_from_jsonld(soup: BeautifulSoup):
     for sc in soup.find_all("script", type=lambda t: t and "ld+json" in t):
         payload = sc.string or sc.get_text() or ""
@@ -298,6 +294,7 @@ def price_from_text(soup: BeautifulSoup, h1_node=None):
     return None
 
 # ----------------- Typ nehnuteľnosti -----------------
+
 def best_type_match(texts):
     hay = " | ".join([t for t in texts if t])[:20000].lower()
     for t in sorted(KNOWN_TYPES, key=len, reverse=True):
@@ -353,6 +350,7 @@ def fallback_type_from_text(*texts):
     return None
 
 # ----------------- POPIS (plný text) -----------------
+
 def _text_of(node):
     if not node: return None
     for br in node.find_all("br"):
@@ -475,7 +473,7 @@ def _from_scripts_initial_state(soup: BeautifulSoup):
             pattern = r'"%s"\s*:\s*"(.*?)"' % re.escape(key)
             for m in re.finditer(pattern, payload, re.I | re.S):
                 val = m.group(1)
-                val = val.replace('\\"','"').replace("\\n","\n").replace("\\r"," ").replace("\\t"," ")
+                val = val.replace('\\"','"').replace("\n","\n").replace("\r"," ").replace("\t"," ")
                 val = _clean_description_text(val)
                 if len(val) > len(best): best = val
     return best or None
@@ -513,115 +511,8 @@ def extract_description_block(soup: BeautifulSoup):
         return best, "fallback-bigblock"
     return None, None
 
-# ----------------- Vlastnosti -----------------
-def extract_features_pairs(soup: BeautifulSoup):
-    pairs = {}
-    feature_root = None
-    for h in soup.find_all(["h2","h3"]):
-        t = clean_spaces(h.get_text(" "))
-        if "vlastnosti nehnute" in norm_txt(t):
-            feature_root = h.parent; break
-    search_scope = feature_root if feature_root else soup
-    for li in search_scope.find_all("li"):
-        txt = clean_spaces(li.get_text(" "))
-        if ":" in txt and len(txt) < 200:
-            label, val = txt.split(":", 1)
-            label = clean_spaces(label); val = clean_spaces(val)
-            if label and val: pairs[label] = val
-    for div in search_scope.find_all("div"):
-        txt = clean_spaces(div.get_text(" "))
-        if ":" in txt and 5 < len(txt) < 200:
-            label, val = txt.split(":", 1)
-            label = clean_spaces(label); val = clean_spaces(val)
-            if label and val and "€" not in val:
-                pairs.setdefault(label, val)
-    return pairs
-
-def _num_from_text_m2(txt):
-    if not txt: return None
-    m = AREA_RE.search(txt)
-    if m:
-        try: return _to_float_area(m.group(1))
-        except: return None
-    digits = re.sub(r"[^0-9,.\u00A0\u202F ]","", txt)
-    digits = digits.replace("\u00A0","").replace("\u202F","").replace(" ","")
-    if digits:
-        digits = digits.replace(",", ".")
-        try: return float(digits)
-        except: return None
-    return None
-
-def normalize_features(pairs: dict):
-    norm = {
-        "land_area_m2": None, "builtup_area_m2": None, "plot_width_m": None,
-        "orientation": None, "ownership": None, "terrain": None,
-        "water": None, "electricity": None, "gas": None, "waste": None,
-        "heating": None, "rooms_count": None,
-    }
-    lab = {k.lower(): v for k,v in pairs.items()}
-    for key in lab:
-        if "plocha pozemku" in key:
-            norm["land_area_m2"] = _num_from_text_m2(lab[key])
-        if "zastavan" in key and "plocha" in key:
-            norm["builtup_area_m2"] = _num_from_text_m2(lab[key])
-        if "šírka pozemku" in key or "sirka pozemku" in key:
-            norm["plot_width_m"] = _num_from_text_m2(lab[key])
-    for key in lab:
-        v = lab[key]; low = key
-        if "orientácia" in low or "orientacia" in low: norm["orientation"] = v
-        if "vlastníctvo" in low or "vlastnictvo" in low: norm["ownership"] = v
-        if "terén" in low or "teren" in low: norm["terrain"] = v
-        if "vykurovanie" in low: norm["heating"] = v
-        if "počet izieb" in low or "pocet izieb" in low or "miestností" in low:
-            m = re.search(r"\d+", v)
-            if m: norm["rooms_count"] = int(m.group())
-    for key in lab:
-        k = key; v = lab[key]
-        if k.startswith("voda"): norm["water"] = v
-        if k.startswith("elektrina"): norm["electricity"] = v
-        if k.startswith("plyn"): norm["gas"] = v
-        if "odpad" in k: norm["waste"] = v
-    return norm
-
-# ----------------- Obrázky: len extrakcia URL -----------------
-def _looks_like_real_image(url: str) -> bool:
-    u = url.lower()
-    if any(bad in u for bad in IMG_BAD_HINTS): return False
-    if "data:image/" in u: return False
-    if not any(h in u for h in IMG_HOST_ALLOW): return False
-    if any(u.endswith(suf) for suf in IMG_SUFFIX_ALLOW): return True
-    if "_fss" in u or "?st=" in u: return True
-    return False
-
-def extract_image_urls(soup: BeautifulSoup):
-    """Zber URL -> zachovať poradie, deduplikovať (stabilné ranky)."""
-    seen = set()
-    out = []
-
-    def _add(u: str):
-        if not u: return
-        if _looks_like_real_image(u) and u not in seen:
-            seen.add(u)
-            out.append(u)
-
-    for img in soup.find_all("img"):
-        for attr in ("src","data-src","data-original","data-lazy"):
-            _add(img.get(attr))
-        srcset = img.get("srcset") or ""
-        if srcset:
-            for part in srcset.split(","):
-                _add(part.strip().split(" ")[0])
-
-    for sel in ["meta[property='og:image']","meta[name='twitter:image']"]:
-        for m in soup.select(sel):
-            _add(m.get("content"))
-
-    for a in soup.find_all("a", href=True):
-        _add(a["href"])
-
-    return out
-
 # ----------------- História cien -----------------
+
 def _nan_to_none(x):
     try:
         if x is None:
@@ -720,6 +611,7 @@ def append_history_if_changed(row_dict, today_state: dict):
     return row_dict
 
 # ----------------- Detail parser -----------------
+
 def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint: str = None) -> dict:
     r = get(session, url); r.raise_for_status()
     html = r.text; soup = BeautifulSoup(html, "html.parser")
@@ -785,9 +677,6 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
         if s_norm in LM_OBCE_NORM or s_norm == norm_txt(obec):
             street = None
 
-    # Obrázky – len URL (sťahovanie rieši iný job) – poradie zachované
-    image_urls = extract_image_urls(soup)
-
     return {
         # KEYS
         "listing_id": listing_id,
@@ -816,12 +705,10 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
 
         # META
         "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-
-        # ephemeral
-        "_image_urls": image_urls
     }
 
 # ----------------- Perzistencia -----------------
+
 def load_master_xlsx(path: str) -> pd.DataFrame:
     cols = [
         # KEYS
@@ -861,6 +748,7 @@ def load_master_xlsx(path: str) -> pd.DataFrame:
                 hist = load_history_from_cell(r.get("price_history"))
                 fixed.append(json.dumps(sanitize_history(hist), ensure_ascii=False, allow_nan=False))
             df["price_history"] = fixed
+        # finálny výber stĺpcov
         return df[[c for c in cols]]
     return pd.DataFrame(columns=cols)
 
@@ -879,7 +767,8 @@ def save_excel(df: pd.DataFrame, path: str):
         raise
 
 # ----------------- BigQuery upload (v2) -----------------
-def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame, images_urls_today: pd.DataFrame):
+
+def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame):
     if not BQ_ENABLE:
         print("[BQ] Preskakujem upload (BQ_ENABLE!=true).")
         return
@@ -973,28 +862,12 @@ def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame, images_urls
         {"name":"scraped_at","type":"STRING"},
     ]
 
-    # DAILY
+    # DAILY (iba dnešné videné)
     d = df_today.copy()
     if not d.empty:
         d["batch_ts"] = pd.Timestamp.utcnow()
     daily_schema = [s for s in master_schema if s["name"] not in ("seq_global","days_listed","active","inactive_since")]
     daily_schema += [{"name":"batch_ts","type":"TIMESTAMP"}]
-
-    # IMAGES URLS
-    imgs = images_urls_today.copy()
-    if not imgs.empty:
-        imgs["batch_ts"] = pd.Timestamp.utcnow()
-        to_str(imgs, ["pk","listing_id","url","image_url"])
-        to_int(imgs, ["seq_global","image_rank"])
-    images_schema = [
-        {"name":"pk","type":"STRING"},
-        {"name":"listing_id","type":"STRING"},
-        {"name":"seq_global","type":"INT64"},
-        {"name":"url","type":"STRING"},
-        {"name":"image_url","type":"STRING"},
-        {"name":"image_rank","type":"INT64"},
-        {"name":"batch_ts","type":"TIMESTAMP"},
-    ]
 
     # Upload
     pandas_gbq.to_gbq(
@@ -1006,14 +879,10 @@ def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame, images_urls
             d, f"{dataset}.listings_daily", project_id=project_id,
             if_exists="append", table_schema=daily_schema, location=location, progress_bar=False
         )
-    if not imgs.empty:
-        pandas_gbq.to_gbq(
-            imgs, f"{dataset}.images_urls_daily", project_id=project_id,
-            if_exists="append", table_schema=images_schema, location=location, progress_bar=False
-        )
     print("[BQ] Upload hotový.")
 
 # ----------------- Crawler -----------------
+
 def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
                    max_links_per_page: int | None = MAX_LINKS_PER_PAGE,
                    max_listings_total: int | None = MAX_LISTINGS_TOTAL):
@@ -1029,7 +898,6 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
 
     total_added = 0
     list_type_hints = {}
-    images_rows = []  # staging riadky pre images_urls_daily
 
     print(f"➡️  CRAWL: {base_url}", flush=True)
 
@@ -1143,17 +1011,6 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
                     if k in master.columns:
                         master.at[i, k] = v
 
-                # namiesto sťahovania obrázkov – uložíme URL do stagingu (rank podľa poradia)
-                seq_global_val = int(master.at[i, "seq_global"]) if pd.notna(master.at[i, "seq_global"]) else None
-                listing_id_val = rec.get("listing_id")
-                rank = 1
-                for uimg in rec.get("_image_urls") or []:
-                    images_rows.append({
-                        "pk": pk, "listing_id": listing_id_val, "seq_global": seq_global_val,
-                        "url": rec.get("url"), "image_url": uimg, "image_rank": rank
-                    })
-                    rank += 1
-
             else:
                 # nový záznam
                 next_seq += 1
@@ -1176,15 +1033,6 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
 
                 master = pd.concat([master, pd.DataFrame([rec_out])], ignore_index=True)
 
-                # staging URL obrázkov pre nový záznam
-                rank = 1
-                for uimg in rec.get("_image_urls") or []:
-                    images_rows.append({
-                        "pk": rec_out["pk"], "listing_id": rec.get("listing_id"), "seq_global": next_seq,
-                        "url": rec.get("url"), "image_url": uimg, "image_rank": rank
-                    })
-                    rank += 1
-
             total_added += 1
             if PROGRESS_EVERY and (total_added % PROGRESS_EVERY == 0):
                 print(f"[{total_added}] {url}", flush=True)
@@ -1206,6 +1054,12 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
     except Exception:
         snap = master.copy()
 
+    # --- GARANCIA UNIKÁTNEHO PK (bez duplicít v rámci behu) ---
+    if "pk" in master.columns:
+        master = master.drop_duplicates(subset=["pk"], keep="last")
+    if "pk" in snap.columns:
+        snap = snap.drop_duplicates(subset=["pk"], keep="last")
+
     # persist XLSX (debug)
     if SAVE_EXCEL:
         save_excel(master.drop(columns=["seen_today"]), MASTER_XLSX)
@@ -1213,12 +1067,10 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
         print(f"✅ Uložený master:   {MASTER_XLSX}", flush=True)
         print(f"✅ Uložený snapshot: {SNAPSHOT_XLSX}", flush=True)
 
-    # upload do BQ (v2)
-    images_df = pd.DataFrame(images_rows, columns=["pk","listing_id","seq_global","url","image_url","image_rank"])
+    # upload do BQ (v2) – bez images_urls_daily
     upload_to_bigquery(
         master.drop(columns=["seen_today"], errors="ignore"),
         snap.drop(columns=["seen_today"], errors="ignore"),
-        images_df
     )
 
 if __name__ == "__main__":
