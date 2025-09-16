@@ -1,271 +1,346 @@
+# image_downloader.py
 # -*- coding: utf-8 -*-
-import os, re, time, math, random, unicodedata
+
+import os
+import re
+import sys
+import time
+import random
+import mimetypes
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import pandas as pd
+
 from google.cloud import bigquery, storage
+from google.api_core.exceptions import NotFound
 
-# ---------------- ENV ----------------
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
-DATASET    = os.getenv("BQ_DATASET", "realestate_v2")
-LOCATION   = os.getenv("BQ_LOCATION", "EU")
-BUCKET     = os.getenv("GCS_BUCKET", "")
+# ========= NATVRDO LIMITY (uprav tu podľa potreby) =========
+IMAGES_LOOKBACK_DAYS   = 3     # koľko dní späť brať batch_ts z images_urls_daily
+IMAGES_MAX_LISTINGS    = 15    # koľko inzerátov spracovať
+IMAGES_MAX_PER_LISTING = 60    # max fotiek na 1 inzerát
+# ===========================================================
 
-LOOKBACK_DAYS        = int(os.getenv("IMAGES_LOOKBACK_DAYS", "3"))
-MAX_LISTINGS         = int(os.getenv("IMAGES_MAX_LISTINGS", "10"))      # nastavíš v jobe
-MAX_PER_LISTING      = int(os.getenv("IMAGES_MAX_PER_LISTING", "60"))   # nastavíš v jobe
-BATCH_DATE_OVERRIDE  = os.getenv("BATCH_DATE", "")  # YYYYMMDD ak chceš
-RECREATE_TABLE       = os.getenv("IMAGES_TABLE_RECREATE", "false").lower() == "true"
+# --------- ENV / konfigurácia GCP ----------
+PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "")
+DATASET      = os.getenv("BQ_DATASET", "")
+LOCATION     = os.getenv("BQ_LOCATION", "EU")
+BUCKET       = os.getenv("GCS_BUCKET", "")
+BATCH_DATE   = os.getenv("BATCH_DATE")  # ak None -> dnešný UTC YYYYMMDD
+PREFIX_ROOT  = "images_v2"              # gs://bucket/images_v2/yyyymmdd/...
 
-# ---------------- HTTP ----------------
+if not PROJECT_ID or not DATASET or not BUCKET:
+    print("[FATAL] Chýba GCP_PROJECT_ID alebo BQ_DATASET alebo GCS_BUCKET.", file=sys.stderr)
+    sys.exit(1)
+
+# --------- helpers (HTTP) ----------
 UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
-def new_session():
-    s = requests.Session()
-    retry = Retry(total=4, connect=3, read=3, backoff_factor=1.2,
-                  status_forcelist=(429, 500, 502, 503, 504),
-                  allowed_methods=frozenset(["GET", "HEAD"]))
-    s.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=20))
-    s.mount("http://", HTTPAdapter(max_retries=retry, pool_maxsize=20))
-    return s
-def headers():
-    return {
+ACCEPT_LANGS = [
+    "sk-SK,sk;q=0.9,cs-CZ;q=0.8,en-US;q=0.7,en;q=0.6",
+    "cs-CZ,sk;q=0.9,en-US;q=0.7,en;q=0.6",
+    "en-US,en;q=0.9,sk;q=0.8,cs;q=0.7",
+]
+
+def rand_headers(extra=None):
+    h = {
         "User-Agent": random.choice(UAS),
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://www.nehnutelnosti.sk/",
+        "Accept": "image/avif,image/webp,image/*;q=0.8,*/*;q=0.5",
+        "Accept-Language": random.choice(ACCEPT_LANGS),
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Referer": "https://www.nehnutelnosti.sk/",
+        "Connection": "close",
     }
+    if extra:
+        h.update(extra)
+    return h
 
-# ---------------- helpers ----------------
-SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_\-]+")
-def safe_slug(s: str) -> str:
-    if not s: return "NA"
-    # strip diacritics
-    s = unicodedata.normalize("NFKD", str(s))
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace(" ", "_")
-    s = SAFE_NAME_RE.sub("-", s).strip("-_")
-    return s or "NA"
+# --------- BQ kandidáti (dedup už v SQL) ----------
+def fetch_candidates(client_bq, lookback_days, max_listings, max_per_listing) -> pd.DataFrame:
+    sql = f"""
+    DECLARE days INT64 DEFAULT @days;
+    DECLARE maxL INT64 DEFAULT @max_listings;
+    DECLARE maxP INT64 DEFAULT @max_per_listing;
 
-EXT_FROM_CT = {
-    "image/jpeg": ".jpg", "image/jpg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/avif": ".avif",
-    "image/gif": ".gif",
-}
-ALLOW_EXT = (".jpg",".jpeg",".png",".webp",".avif",".gif",".jfif")
-
-def guess_ext(url: str, content_type: str|None) -> str:
-    u = url.lower()
-    for e in ALLOW_EXT:
-        if u.split("?")[0].endswith(e):
-            return e
-    if content_type:
-        return EXT_FROM_CT.get(content_type.split(";")[0].lower(), ".webp")
-    return ".webp"
-
-def bq_client():      return bigquery.Client(project=PROJECT_ID)
-def gcs_client():     return storage.Client(project=PROJECT_ID)
-
-def table_exists(client: bigquery.Client, table_id: str) -> bool:
-    try:
-        client.get_table(table_id); return True
-    except Exception:
-        return False
-
-def ensure_images_table(client: bigquery.Client, table_id: str):
-    schema = [
-        bigquery.SchemaField("pk", "STRING"),
-        bigquery.SchemaField("listing_id", "STRING"),
-        bigquery.SchemaField("seq_global", "INTEGER"),
-        bigquery.SchemaField("url", "STRING"),
-        bigquery.SchemaField("image_url", "STRING"),
-        bigquery.SchemaField("image_rank", "INTEGER"),
-        bigquery.SchemaField("gcs_uri", "STRING"),
-        bigquery.SchemaField("downloaded_at", "TIMESTAMP"),
+    -- 1) zober posledné N dní, a vyber 1x (pk, image_url)
+    WITH src AS (
+      SELECT
+        pk, listing_id, seq_global, url, image_url, image_rank, batch_ts,
+        ROW_NUMBER() OVER (
+          PARTITION BY pk, image_url
+          ORDER BY batch_ts DESC, image_rank ASC
+        ) AS rn
+      FROM `{PROJECT_ID}.{DATASET}.images_urls_daily`
+      WHERE batch_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL days DAY)
+    ),
+    uniq AS (
+      SELECT pk, listing_id, seq_global, url, image_url, image_rank, batch_ts
+      FROM src
+      WHERE rn = 1
+    ),
+    -- 2) top N fotiek na inzerát podľa image_rank
+    per_listing AS (
+      SELECT
+        u.*,
+        ROW_NUMBER() OVER (PARTITION BY pk ORDER BY image_rank ASC) AS rnk
+      FROM uniq u
+    ),
+    limited_per_listing AS (
+      SELECT * FROM per_listing WHERE rnk <= maxP
+    ),
+    -- 3) obmedzíme počet inzerátov
+    pick_listings AS (
+      SELECT
+        *, DENSE_RANK() OVER (ORDER BY seq_global ASC) AS listing_order
+      FROM limited_per_listing
+    )
+    SELECT
+      pk, listing_id, seq_global, url, image_url, rnk AS image_rank, batch_ts
+    FROM pick_listings
+    WHERE listing_order <= maxL
+    ORDER BY seq_global, image_rank;
+    """
+    params = [
+        bigquery.ScalarQueryParameter("days", "INT64", lookback_days),
+        bigquery.ScalarQueryParameter("max_listings", "INT64", max_listings),
+        bigquery.ScalarQueryParameter("max_per_listening", "INT64", max_per_listing),  # typo guard if used?
     ]
-    if RECREATE_TABLE and table_exists(client, table_id):
-        client.delete_table(table_id, not_found_ok=True)
-    if not table_exists(client, table_id):
-        client.create_table(bigquery.Table(table_id, schema=schema))
-    return schema
-
-def query_df(client: bigquery.Client, sql: str, params: list[bigquery.ScalarQueryParameter] = None) -> pd.DataFrame:
-    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params or []), location=LOCATION)
+    # correct param name:
+    params = [
+        bigquery.ScalarQueryParameter("days", "INT64", lookback_days),
+        bigquery.ScalarQueryParameter("max_listings", "INT64", max_listings),
+        bigquery.ScalarQueryParameter("max_per_listings", "INT64", max_per_listing),
+    ]
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("days", "INT64", lookback_days),
+            bigquery.ScalarQueryParameter("max_listings", "INT64", max_listings),
+            bigquery.ScalarQueryParameter("max_per_listings", "INT64", max_per_listing),
+        ]
+    )
+    job = client_bq.query(sql, job_config=job_config)
     return job.result().to_dataframe(create_bqstorage_client=False)
 
-# ---------------- load candidate URLs ----------------
-def load_candidates(client: bigquery.Client) -> pd.DataFrame:
-    # Prefer images_urls_daily in lookback window; fallback to image_urls_staging
-    sql_daily = f"""
-    SELECT pk, listing_id, seq_global, url, image_url, image_rank, batch_ts
-    FROM `{PROJECT_ID}.{DATASET}.images_urls_daily`
-    WHERE DATE(batch_ts) >= DATE_SUB(CURRENT_DATE(), INTERVAL @d DAY)
-    ORDER BY COALESCE(seq_global, 0), image_rank
-    """
+# --------- util: bezpečný názov priečinka ---------
+SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_\-]+")
+
+def safe_slug(s: str, default="NA") -> str:
+    if not s:
+        return default
+    s = str(s)
+    s = s.strip().replace(" ", "-")
+    s = SAFE_CHARS_RE.sub("-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or default
+
+# --------- util: odhad prípony podľa Content-Type/URL ---------
+CT_TO_EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg":  ".jpg",
+    "image/png":  ".png",
+    "image/webp": ".webp",
+    "image/avif": ".avif",
+    "image/gif":  ".gif",
+}
+
+def choose_ext(img_url: str, content_type: str | None) -> str:
+    if content_type:
+        ct = content_type.split(";")[0].strip().lower()
+        if ct in CT_TO_EXT:
+            return CT_TO_EXT[ct]
+    # fallback z URL
+    path = urlparse(img_url).path.lower()
+    for e in (".jpg",".jpeg",".png",".webp",".avif",".jfif",".gif"):
+        if path.endswith(e):
+            return ".jpg" if e == ".jpeg" else e
+    return ".webp"
+
+# --------- BQ: vytvor/zarovnaj schému tabuľky images ----------
+CANON_SCHEMA = [
+    bigquery.SchemaField("pk",           "STRING"),
+    bigquery.SchemaField("listing_id",   "STRING"),
+    bigquery.SchemaField("seq_global",   "INT64"),
+    bigquery.SchemaField("image_url",    "STRING"),
+    bigquery.SchemaField("image_rank",   "INT64"),
+    bigquery.SchemaField("gcs_path",     "STRING"),
+    bigquery.SchemaField("content_type", "STRING"),
+    bigquery.SchemaField("size_bytes",   "INT64"),
+    bigquery.SchemaField("downloaded_at","TIMESTAMP"),
+    # POZN: 'url' (detail URL) sem zámerne nedávame kvôli kompatibilite s existujúcou tabuľkou.
+]
+
+def ensure_table_and_align_df(client_bq: bigquery.Client, df: pd.DataFrame, table_id: str) -> pd.DataFrame:
+    """Ak tabuľka neexistuje -> vytvor s CANON_SCHEMA.
+       Ak existuje -> necháme pôvodnú schému a DF obmedzíme na prienik stĺpcov."""
     try:
-        df = query_df(client, sql_daily, [bigquery.ScalarQueryParameter("d", "INT64", LOOKBACK_DAYS)])
-        if not df.empty:
-            return df
-    except Exception:
-        pass
+        tbl = client_bq.get_table(table_id)
+        existing_cols = [f.name for f in tbl.schema]
+        # odfiltruj stĺpce, ktoré v tabuľke nie sú (napr. 'url')
+        keep = [c for c in df.columns if c in existing_cols]
+        df2 = df[keep].copy()
+        return df2
+    except NotFound:
+        # vytvor novú tabuľku s kanonickou schémou
+        dataset_id = ".".join(table_id.split(".")[:2])
+        # dataset musí existovať; ak nie, vyhoďu sa zrozumiteľné chyby z API
+        table = bigquery.Table(table_id, schema=CANON_SCHEMA)
+        table.location = LOCATION
+        client_bq.create_table(table)
+        # DF obmedz na kanonické stĺpce
+        keep = [f.name for f in CANON_SCHEMA if f.name in df.columns]
+        df2 = df[keep].copy()
+        return df2
 
-    sql_staging = f"""
-    SELECT pk, listing_id, seq_global, url, image_url, image_rank, CURRENT_TIMESTAMP() AS batch_ts
-    FROM `{PROJECT_ID}.{DATASET}.image_urls_staging`
-    ORDER BY COALESCE(seq_global, 0), image_rank
-    """
-    try:
-        return query_df(client, sql_staging)
-    except Exception:
-        return pd.DataFrame(columns=["pk","listing_id","seq_global","url","image_url","image_rank","batch_ts"])
-
-def filter_limits(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    # within each listing keep first MAX_PER_LISTING by image_rank
-    df = df.sort_values(["pk","image_rank"], kind="mergesort")
-    df["__rn"] = df.groupby("pk").cumcount() + 1
-    df = df[df["__rn"] <= MAX_PER_LISTING].drop(columns="__rn")
-    # keep only first MAX_LISTINGS distinct pk by seq_global asc
-    order = df.groupby("pk")["seq_global"].min().sort_values(kind="mergesort")
-    keep_pks = set(order.index[:MAX_LISTINGS].tolist())
-    return df[df["pk"].isin(keep_pks)].copy()
-
-def already_downloaded(client: bigquery.Client, pks: list[str]) -> set[str]:
-    if not pks: return set()
-    if not table_exists(client, f"{PROJECT_ID}.{DATASET}.images"):
-        return set()
-    sql = f"""
-    SELECT DISTINCT image_url
-    FROM `{PROJECT_ID}.{DATASET}.images`
-    WHERE pk IN UNNEST(@pks)
-    """
-    df = query_df(client, sql, [bigquery.ArrayQueryParameter("pks", "STRING", pks)])
-    return set(df["image_url"].dropna().astype(str).tolist())
-
-# ---------------- main ----------------
+# --------- MAIN ----------
 def main():
-    if not (PROJECT_ID and DATASET and LOCATION and BUCKET):
-        raise SystemExit("Missing one of required env vars: GCP_PROJECT_ID, BQ_DATASET, BQ_LOCATION, GCS_BUCKET")
+    session = requests.Session()
 
-    client_bq  = bq_client()
-    client_gcs = gcs_client()
-    bucket     = client_gcs.bucket(BUCKET)
+    client_bq = bigquery.Client(project=PROJECT_ID, location=LOCATION)
+    client_gcs = storage.Client(project=PROJECT_ID)
+    bucket = client_gcs.bucket(BUCKET)
 
-    # Prepare output table
-    table_id = f"{PROJECT_ID}.{DATASET}.images"
-    schema   = ensure_images_table(client_bq, table_id)
+    batch_date = BATCH_DATE or datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"{PREFIX_ROOT}/{batch_date}"
 
-    # Load candidates & apply limits
-    df = load_candidates(client_bq)
-    if df.empty:
-        print("No image URLs available. Done.")
-        return
-    df = filter_limits(df)
-
-    # Dedup with already downloaded
-    pks = sorted(df["pk"].dropna().astype(str).unique().tolist())
-    done_urls = already_downloaded(client_bq, pks)
-    df = df[~df["image_url"].isin(done_urls)].copy()
-    if df.empty:
-        print("No new image URLs to download. Done.")
-        return
-
-    # Batch date prefix
-    if BATCH_DATE_OVERRIDE:
-        batch_date = BATCH_DATE_OVERRIDE
-    else:
-        # UTC date so je stabilná naprieč runnermi
-        batch_date = datetime.now(timezone.utc).strftime("%Y%m%d")
-
-    s = new_session()
-    rows = []
-    # ensure proper dtypes present
-    for col in ("seq_global","image_rank"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # group by listing for folder naming
-    df = df.sort_values(["seq_global","pk","image_rank"], kind="mergesort")
-    for (pk, listing_id, seq_global), grp in df.groupby(["pk","listing_id","seq_global"], dropna=False):
-        seq = int(seq_global) if not pd.isna(seq_global) else 0
-        lid = safe_slug(listing_id)
-        folder = f"images_v2/{batch_date}/{seq:06d}_{lid}/"
-
-        # iterate images in rank order
-        for _, r in grp.sort_values("image_rank").iterrows():
-            img_url   = str(r["image_url"])
-            detail_url= str(r.get("url") or "")
-            rank      = int(r.get("image_rank") or 0)
-
-            try:
-                resp = s.get(img_url, headers=headers(), timeout=30)
-            except Exception as e:
-                print(f"[ERR] {img_url} -> {e}")
-                continue
-            if resp.status_code != 200 or not resp.content or len(resp.content) < 3000:
-                print(f"[SKIP {resp.status_code}] {img_url}")
-                continue
-
-            ext = guess_ext(img_url, resp.headers.get("Content-Type"))
-            name = f"{rank:03d}{ext}"
-            blob_path = folder + name
-            blob = bucket.blob(blob_path)
-
-            try:
-                ct = resp.headers.get("Content-Type") or "application/octet-stream"
-                blob.upload_from_string(resp.content, content_type=ct)
-            except Exception as e:
-                print(f"[ERR-UPLOAD] {blob_path} -> {e}")
-                continue
-
-            gcs_uri = f"gs://{BUCKET}/{blob_path}"
-            print(f"[OK] {gcs_uri}")
-
-            rows.append({
-                "pk": str(pk) if pk is not None else None,
-                "listing_id": str(listing_id) if listing_id is not None else None,
-                "seq_global": seq if not pd.isna(seq_global) else None,
-                "url": detail_url,
-                "image_url": img_url,
-                "image_rank": rank,
-                "gcs_uri": gcs_uri,
-                "downloaded_at": pd.Timestamp.utcnow(),  # TIMESTAMP
-            })
-
-    if not rows:
-        print("Nothing saved. Done.")
-        return
-
-    df_out = pd.DataFrame(rows, columns=[
-        "pk","listing_id","seq_global","url","image_url","image_rank","gcs_uri","downloaded_at"
-    ])
-
-    # Coerce dtypes for BQ
-    df_out["pk"] = df_out["pk"].astype("string")
-    df_out["listing_id"] = df_out["listing_id"].astype("string")
-    df_out["url"] = df_out["url"].astype("string")
-    df_out["image_url"] = df_out["image_url"].astype("string")
-    df_out["gcs_uri"] = df_out["gcs_uri"].astype("string")
-    df_out["seq_global"] = pd.to_numeric(df_out["seq_global"], errors="coerce").astype("Int64")
-    df_out["image_rank"] = pd.to_numeric(df_out["image_rank"], errors="coerce").astype("Int64")
-    df_out["downloaded_at"] = pd.to_datetime(df_out["downloaded_at"], utc=True)
-
-    job_cfg = bigquery.LoadJobConfig(
-        schema=schema,
-        write_disposition="WRITE_APPEND",
+    # 1) kandidáti z BQ (dedup už v SQL)
+    df = fetch_candidates(
+        client_bq,
+        IMAGES_LOOKBACK_DAYS,
+        IMAGES_MAX_LISTINGS,
+        IMAGES_MAX_PER_LISTING
     )
-    job = client_bq.load_table_from_dataframe(df_out, table_id, job_config=job_cfg, location=LOCATION)
+
+    if df.empty:
+        print("No candidates found. Done.")
+        return
+
+    # 2) poistka proti duplicitám; re-rank v rámci pk 1..N
+    df = df.drop_duplicates(subset=["pk", "image_url"], keep="first")
+    df = df.sort_values(["seq_global", "pk", "image_rank"])
+    df["image_rank"] = df.groupby("pk").cumcount() + 1
+
+    rows_out = []  # audit pre BQ
+
+    for _, row in df.iterrows():
+        pk          = str(row.get("pk") or "")
+        listing_id  = safe_slug(row.get("listing_id"), default="NA")
+        seq_global  = int(row.get("seq_global") or 0)
+        image_url   = str(row.get("image_url") or "")
+        image_rank  = int(row.get("image_rank") or 0)
+        detail_url  = row.get("url")  # môže byť None a tabuľka ho nemusí mať
+
+        folder = f"{prefix}/{seq_global:06d}_{listing_id}"
+        # najprv si odhadni ext iba podľa URL (ak Content-Type nepovie inak)
+        ext_guess = choose_ext(image_url, None)
+        target_name = f"{folder}/{image_rank:03d}{ext_guess}"
+
+        blob = bucket.blob(target_name)
+        if blob.exists(client_gcs):
+            print(f"[SKIP exists] gs://{BUCKET}/{target_name}")
+            # aj SKIP chceme zalogovať, ale bez veľkosti (size) -> ponechaj size_bytes=None
+            rows_out.append({
+                "pk": pk,
+                "listing_id": listing_id,
+                "seq_global": seq_global,
+                "image_url": image_url,
+                "image_rank": image_rank,
+                "gcs_path": f"gs://{BUCKET}/{target_name}",
+                "content_type": None,
+                "size_bytes": None,
+                "downloaded_at": pd.Timestamp.utcnow(tz="UTC"),
+                "url": detail_url,  # voliteľný; pri load-e sa odfiltruje, ak v tabuľke nie je
+            })
+            continue
+
+        # stiahni
+        try:
+            resp = session.get(
+                image_url,
+                headers=rand_headers(),
+                timeout=25,
+                stream=True,
+            )
+        except Exception as e:
+            print(f"[ERR GET] {image_url} -> {e}")
+            continue
+
+        if resp.status_code != 200:
+            print(f"[SKIP HTTP {resp.status_code}] {image_url}")
+            continue
+
+        content = resp.content or b""
+        if len(content) < 3000:
+            print(f"[SKIP tiny] {image_url}")
+            continue
+
+        # upresni príponu podľa Content-Type
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        final_ext = choose_ext(image_url, ctype)
+        if final_ext != ext_guess:
+            # zmeň cieľový názov, aby zodpovedal skutočnému typu
+            target_name = f"{folder}/{image_rank:03d}{final_ext}"
+            blob = bucket.blob(target_name)
+
+        # upload
+        try:
+            blob.upload_from_string(content, content_type=ctype or "application/octet-stream")
+            print(f"[OK] gs://{BUCKET}/{target_name}")
+        except Exception as e:
+            print(f"[ERR UPLOAD] gs://{BUCKET}/{target_name} -> {e}")
+            continue
+
+        size_bytes = len(content)
+        rows_out.append({
+            "pk": pk,
+            "listing_id": listing_id,
+            "seq_global": seq_global,
+            "image_url": image_url,
+            "image_rank": image_rank,
+            "gcs_path": f"gs://{BUCKET}/{target_name}",
+            "content_type": ctype or None,
+            "size_bytes": int(size_bytes),
+            "downloaded_at": pd.Timestamp.utcnow(tz="UTC"),
+            "url": detail_url,  # voliteľný; pri load-e sa odfiltruje, ak v tabuľke nie je
+        })
+
+        # šetrná pauza (trošku random)
+        time.sleep(random.uniform(0.05, 0.15))
+
+    # 3) audit -> BQ.images
+    if not rows_out:
+        print("Nothing to write to BigQuery. Done.")
+        return
+
+    df_out = pd.DataFrame(rows_out)
+
+    # typy (hlavne downloaded_at -> datetime64[ns, UTC])
+    if "downloaded_at" in df_out.columns:
+        df_out["downloaded_at"] = pd.to_datetime(df_out["downloaded_at"], utc=True)
+
+    for col in ("seq_global", "image_rank", "size_bytes"):
+        if col in df_out.columns:
+            df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype("Int64")
+
+    for col in ("pk","listing_id","image_url","gcs_path","content_type","url"):
+        if col in df_out.columns:
+            df_out[col] = df_out[col].astype("string")
+
+    table_id = f"{PROJECT_ID}.{DATASET}.images"
+    df_aligned = ensure_table_and_align_df(client_bq, df_out, table_id)
+
+    # finálny load (append)
+    job = client_bq.load_table_from_dataframe(
+        df_aligned,
+        table_id,
+        location=LOCATION
+    )
     job.result()
-    print("[BQ] images append OK")
+    print(f"[BQ] Written {len(df_aligned)} rows to {table_id}.")
 
 if __name__ == "__main__":
     main()
