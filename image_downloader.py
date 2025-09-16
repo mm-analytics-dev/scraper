@@ -51,14 +51,12 @@ def safe_int(x):
             return None
 
 def ext_from_response(url: str, resp: requests.Response) -> str:
-    # prefer Content-Type
     ct = (resp.headers.get("Content-Type") or "").lower()
     if "image/webp" in ct: return ".webp"
     if "image/jpeg" in ct or "image/jpg" in ct: return ".jpg"
     if "image/png" in ct: return ".png"
     if "image/avif" in ct: return ".avif"
     if "image/gif" in ct: return ".gif"
-    # fallback to URL
     path = urlparse(url).path.lower()
     for suf in (".webp",".jpg",".jpeg",".png",".avif",".gif",".jfif"):
         if path.endswith(suf):
@@ -74,14 +72,13 @@ def gcs_blob_exists(path: str) -> bool:
     return bucket.blob(path).exists()
 
 def ensure_images_table():
-    """(re)create images table with the correct schema when TABLE_RECREATE=true."""
     table_id = f"{PROJECT_ID}.{DATASET}.images"
     schema = [
         bigquery.SchemaField("pk", "STRING"),
         bigquery.SchemaField("listing_id", "STRING"),
         bigquery.SchemaField("seq_global", "INT64"),
-        bigquery.SchemaField("url", "STRING"),          # URL detailu inzerátu
-        bigquery.SchemaField("image_url", "STRING"),    # zdrojová URL
+        bigquery.SchemaField("url", "STRING"),
+        bigquery.SchemaField("image_url", "STRING"),
         bigquery.SchemaField("image_rank", "INT64"),
         bigquery.SchemaField("gcs_path", "STRING"),
         bigquery.SchemaField("batch_date", "DATE"),
@@ -98,22 +95,16 @@ def ensure_images_table():
         except Exception as e:
             print(f"[BQ] Drop error (ignored): {e}")
         table = bigquery.Table(table_id, schema=schema)
-        table = bq.create_table(table)
+        bq.create_table(table)
         print(f"[BQ] Created table {table_id} with schema.")
-    else:
-        # nothing; we append later (and let it be created by pandas_gbq if missing)
-        pass
 
 def query_df(sql: str, params: list[ScalarQueryParameter]) -> pd.DataFrame:
     job = bq.query(sql, job_config=QueryJobConfig(query_parameters=params))
     return job.result().to_dataframe(create_bqstorage_client=False)
 
 # ---------- SQL: fetch candidates ----------
+# !!! ŽIADNE DECLARE. Používame iba @parametre, aby LIMIT/okno nemalo problém.
 SQL_CANDIDATES = f"""
-DECLARE lookback_days INT64 DEFAULT @lookback_days;
-DECLARE max_listings  INT64 DEFAULT @max_listings;
-DECLARE max_per       INT64 DEFAULT @max_per;
-
 WITH base AS (
   SELECT
     pk,
@@ -125,11 +116,9 @@ WITH base AS (
     batch_ts,
     DATE(batch_ts) AS batch_date
   FROM `{PROJECT_ID}.{DATASET}.images_urls_daily`
-  WHERE batch_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL lookback_days DAY)
+  WHERE batch_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_days DAY)
 ),
 dedup AS (
-  -- 1) posledná verzia rovnakej image_url v rámci pk
-  -- 2) poistka na duplicity v tom istom ranku
   SELECT * EXCEPT(rn1, rn2)
   FROM (
     SELECT
@@ -147,14 +136,17 @@ pk_list AS (
     FROM dedup
     GROUP BY pk
     ORDER BY last_ts DESC
-    LIMIT max_listings
+    LIMIT @max_listings
   )
 ),
 limited AS (
-  SELECT d.*
-  FROM dedup d
-  JOIN pk_list p USING (pk)
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY pk ORDER BY image_rank) <= max_per
+  SELECT *
+  FROM (
+    SELECT d.*, ROW_NUMBER() OVER (PARTITION BY pk ORDER BY image_rank) AS rnk
+    FROM dedup d
+    JOIN pk_list p USING (pk)
+  )
+  WHERE rnk <= @max_per
 )
 SELECT
   pk, listing_id, seq_global, listing_url, image_url, image_rank, batch_date
@@ -179,7 +171,7 @@ def download_and_upload(row, base_prefix: str):
     rank = safe_int(row["image_rank"]) or 0
 
     folder = make_folder(seq_global, listing_id)
-    # Request first (to decide extension & content-type)
+
     try:
         resp = SESSION.get(url, timeout=REQ_TIMEOUT, stream=True)
         status = resp.status_code
@@ -209,7 +201,6 @@ def download_and_upload(row, base_prefix: str):
     filename = f"{rank:03d}{ext}"
     gcs_path = f"{base_prefix}/{folder}/{filename}"
 
-    # Skip if already uploaded
     if gcs_blob_exists(gcs_path):
         return {
             **row,
@@ -221,7 +212,6 @@ def download_and_upload(row, base_prefix: str):
             "error": None,
         }
 
-    # Read bytes
     try:
         content = resp.content
         size = len(content)
@@ -255,18 +245,16 @@ def download_and_upload(row, base_prefix: str):
 
 # ---------- BQ writer ----------
 def write_results(df_out: pd.DataFrame):
-    # enforce dtypes
     if df_out.empty:
         return
     df = df_out.copy()
-    df["seq_global"]   = pd.to_numeric(df["seq_global"], errors="coerce").astype("Int64")
-    df["image_rank"]   = pd.to_numeric(df["image_rank"], errors="coerce").astype("Int64")
-    df["http_status"]  = pd.to_numeric(df["http_status"], errors="coerce").astype("Int64")
-    df["bytes"]        = pd.to_numeric(df["bytes"], errors="coerce").astype("Int64")
-    df["downloaded_at"]= pd.to_datetime(df["downloaded_at"], utc=True)
-    df["batch_date"]   = pd.to_datetime(df["batch_date"], errors="coerce").dt.date
+    df["seq_global"]    = pd.to_numeric(df["seq_global"], errors="coerce").astype("Int64")
+    df["image_rank"]    = pd.to_numeric(df["image_rank"], errors="coerce").astype("Int64")
+    df["http_status"]   = pd.to_numeric(df["http_status"], errors="coerce").astype("Int64")
+    df["bytes"]         = pd.to_numeric(df["bytes"], errors="coerce").astype("Int64")
+    df["downloaded_at"] = pd.to_datetime(df["downloaded_at"], utc=True)
+    df["batch_date"]    = pd.to_datetime(df["batch_date"], errors="coerce").dt.date
 
-    # pandas_gbq append
     import pandas_gbq
     schema = [
         {"name":"pk","type":"STRING"},
@@ -300,18 +288,15 @@ def main():
 
     ensure_images_table()
 
-    # fetch work
     cand = fetch_candidates()
     if cand.empty:
         print("[INFO] Žiadni kandidáti na sťahovanie (v lookback okne).")
         return
 
-    # cieľový prefix
     batch_yyyymmdd = yyyymmdd_today_utc()
     base_prefix = f"images_v2/{batch_yyyymmdd}"
 
-    # dedup v rámci behu (pre istotu)
-    seen_paths = set()
+    seen = set()
     results = []
 
     for _, r in cand.iterrows():
@@ -324,13 +309,11 @@ def main():
             "image_rank": r.get("image_rank"),
             "batch_date": r.get("batch_date") or date.today(),
         }
-        # Predikcia GCS path (ak by sme vedeli ext až po headere, skipneme iba keď už reálne existuje)
         out = download_and_upload(row, base_prefix)
-        # ešte vnútrobehový dedup (keď by kandidáty obsahovali duplicitný rank)
         key = (out.get("pk"), out.get("image_rank"), out.get("gcs_path"))
-        if key in seen_paths:
+        if key in seen:
             continue
-        seen_paths.add(key)
+        seen.add(key)
         results.append(out)
 
     df_out = pd.DataFrame(results, columns=[
