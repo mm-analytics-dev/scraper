@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Images downloader (v4) -> GCS + BigQuery (PK -> GCS URL)
+Images downloader (v5) -> GCS + BigQuery (PK -> GCS URL)
 
-Funkcia:
-- Z {DATASET}.listings_master zoberie inzeráty v lookback okne (IMAGES_LOOKBACK_DAYS),
-  max IMAGES_MAX_LISTINGS kusov (podľa seq_global).
-- Z detailu inzerátu vyparsuje VŠETKY rozumné image URL (og:image, JSON-LD, galéria, srcset, data-*).
-- Každý obrázok (max IMAGES_MAX_PER_LISTING) stiahne, uloží do GCS pod images_v2/YYYYMMDD/{FOLDER}/{NNN.ext}
-  a do BQ {DATASET}.{IMAGES_PK_GCS_TABLE} zapíše jeden riadok: (pk, gcs_url, downloaded_at, batch_date).
-- Idempotentné:
-    * ak gs://... už existuje -> upload preskočí,
-    * pred zápisom do BQ odfiltruje už existujúce (pk,gcs_url).
+Co robi:
+- Z {DATASET}.listings_master vezme inzeraty v lookback okne (IMAGES_LOOKBACK_DAYS),
+  max IMAGES_MAX_LISTINGS kusov.
+- Z detailu vyparsuje VSETKY rozumne image URL (og:image, JSON-LD, <img>, srcset, data-*) a odfiltruje duplicity.
+- Stiahne max IMAGES_MAX_PER_LISTING obrazkov na inzerat.
+- Ulozi do GCS: images_v2/YYYYMMDD/{SEQ}_{listing_id}/NNN.ext
+- Do BQ {DATASET}.{IMAGES_PK_GCS_TABLE} zapise kazdu fotku zvlast: (pk, gcs_url, downloaded_at, batch_date).
+- Idempotentne: preskoci existujuce GCS objekty + pred zapisom do BQ odfiltruje existujuce (pk, gcs_url).
+
+Skript si SAM DOINSTALUJE zalezitosti (beautifulsoup4, google-cloud-bigquery, google-cloud-storage, requests, pandas),
+aby v CI nikdy nepadal na ModuleNotFoundError.
 
 ENV:
   GOOGLE_APPLICATION_CREDENTIALS=./sa.json
@@ -18,13 +20,42 @@ ENV:
   BQ_DATASET=realestate_v2
   BQ_LOCATION=EU
   GCS_BUCKET=...
-  IMAGES_LOOKBACK_DAYS=7
-  IMAGES_MAX_LISTINGS=200
+  IMAGES_LOOKBACK_DAYS=3
+  IMAGES_MAX_LISTINGS=15
   IMAGES_MAX_PER_LISTING=60
-  BATCH_DATE=YYYYMMDD (optional; ak nie je, berie dnešný UTC)
+  BATCH_DATE=YYYYMMDD (optional)
   IMAGES_PK_GCS_TABLE=images_pk_gcs (optional; default)
 """
 
+# ---------- SELF-INSTALL DEPENDENCIES (for CI/GHA) ----------
+import sys, subprocess
+
+def _ensure(pkg_name: str, import_name: str | None = None, min_version: str | None = None):
+    """
+    Ensure a package is importable; if not, pip install it.
+    """
+    mod = import_name or pkg_name
+    try:
+        __import__(mod)
+        return
+    except Exception:
+        pass
+    to_install = pkg_name + (f">={min_version}" if min_version else "")
+    print(f"[DEPS] Installing {to_install} ...", flush=True)
+    # no --user (GHA runner allows system install in venv)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", to_install])
+
+# minimal set
+_ensure("requests", "requests", "2.31.0")
+_ensure("urllib3", "urllib3", "2.2.0")
+_ensure("pandas", "pandas", "2.2.1")
+_ensure("beautifulsoup4", "bs4", "4.12.3")
+_ensure("google-cloud-bigquery", "google.cloud.bigquery", "3.25.0")
+_ensure("google-cloud-storage", "google.cloud.storage", "2.16.0")
+# auth lib sometimes missing
+_ensure("google-auth", "google.auth", "2.27.0")
+
+# ---------- IMPORTS (after ensuring) ----------
 import os
 import re
 import time
@@ -43,20 +74,20 @@ from bs4 import BeautifulSoup
 from google.cloud import bigquery
 from google.cloud import storage
 
-# --------- ENV ---------
+# ---------- ENV ----------
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
 DATASET = os.getenv("BQ_DATASET", "realestate_v2").strip()
 LOCATION = os.getenv("BQ_LOCATION", "EU").strip()
 BUCKET_NAME = os.getenv("GCS_BUCKET", "").strip()
 
-LOOKBACK_DAYS     = int(os.getenv("IMAGES_LOOKBACK_DAYS", "7"))
-MAX_LISTINGS      = int(os.getenv("IMAGES_MAX_LISTINGS", "200"))
+LOOKBACK_DAYS     = int(os.getenv("IMAGES_LOOKBACK_DAYS", "3"))
+MAX_LISTINGS      = int(os.getenv("IMAGES_MAX_LISTINGS", "15"))
 MAX_PER_LISTING   = int(os.getenv("IMAGES_MAX_PER_LISTING", "60"))
 
 BATCH_DATE_ENV    = os.getenv("BATCH_DATE", "").strip()
 IMAGES_PK_GCS_TABLE = os.getenv("IMAGES_PK_GCS_TABLE", "images_pk_gcs").strip()
 
-# --------- Batch date / prefixes ---------
+# ---------- BATCH / PREFIX ----------
 def today_yyyymmdd_utc() -> str:
     if BATCH_DATE_ENV:
         if not re.fullmatch(r"\d{8}", BATCH_DATE_ENV):
@@ -70,7 +101,7 @@ BASE_PREFIX = f"images_v2/{BATCH_YYYYMMDD}"
 def now_utc() -> pd.Timestamp:
     return pd.Timestamp.now(tz=timezone.utc)
 
-# --------- HTTP session with retries ---------
+# ---------- HTTP SESSION ----------
 SESSION = requests.Session()
 _retry = Retry(
     total=4, connect=3, read=3, backoff_factor=1.2,
@@ -103,12 +134,12 @@ def rand_headers_img(extra=None):
     h["Accept"] = "image/avif,image/webp,image/*,*/*;q=0.8"
     return h
 
-# --------- GCS / BQ clients ---------
+# ---------- GCS / BQ ----------
 bq = bigquery.Client(project=PROJECT_ID or None, location=LOCATION or None)
 gcs = storage.Client(project=PROJECT_ID or None)
 bucket = gcs.bucket(BUCKET_NAME) if BUCKET_NAME else None
 
-# --------- SQL: kandidáti z listings_master ---------
+# ---------- SQL: kandidati ----------
 SQL_CANDIDATES = """
 SELECT pk, listing_id, seq_global, url
 FROM `{{PROJECT_ID}}.{{DATASET}}.listings_master`
@@ -130,7 +161,7 @@ def fetch_candidates() -> pd.DataFrame:
     ]
     return query_df(SQL_CANDIDATES, params)
 
-# --------- Helpers ---------
+# ---------- HELPERS ----------
 def slugify(s: str) -> str:
     if not s: return "na"
     s = s.lower()
@@ -169,14 +200,13 @@ def gcs_blob_exists(path: str) -> bool:
     return blob.exists(client=gcs)
 
 def strip_query(u: str) -> str:
-    # Pomôže dedupu rôznych variant rovnakého obrázka s query parametrami
     try:
         p = urlparse(u)
         return p._replace(query="").geturl()
     except Exception:
         return u
 
-# --------- Parsovanie VŠETKÝCH image URL z detailu ---------
+# ---------- PARSING ALL IMAGE URLS ----------
 def extract_image_urls(html: str, page_url: str, limit: int) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[str] = []
@@ -190,12 +220,12 @@ def extract_image_urls(html: str, page_url: str, limit: int) -> List[str]:
             seen.add(key)
             out.append(au)
 
-    # 1) og:image (zober aj viac, ak ich je viac)
+    # og:image
     for og in soup.find_all("meta", property="og:image"):
         if og.get("content"): push(og["content"])
         if len(out) >= limit: return out[:limit]
 
-    # 2) JSON-LD "image" (string alebo pole)
+    # JSON-LD "image"
     for sc in soup.find_all("script", type=lambda t: t and "ld+json" in t):
         payload = sc.string or sc.get_text() or ""
         if not payload.strip(): continue
@@ -218,7 +248,7 @@ def extract_image_urls(html: str, page_url: str, limit: int) -> List[str]:
                 stack.extend(obj)
         if len(out) >= limit: return out[:limit]
 
-    # 3) Galéria / hero – <img> s rôznymi atribútmi
+    # gallery/hero images
     selectors = [
         "[class*='gallery'] img", "[class*='carousel'] img", "[class*='swiper'] img",
         "[class*='slider'] img", "[class*='image'] img", "img"
@@ -227,7 +257,6 @@ def extract_image_urls(html: str, page_url: str, limit: int) -> List[str]:
         for img in soup.select(sel):
             for attr in ("data-full", "data-original", "data-src", "data-lazy", "src"):
                 if img.get(attr): push(img.get(attr))
-            # srcset
             ss = img.get("srcset") or img.get("data-srcset")
             if ss:
                 parts = [p.strip().split(" ")[0] for p in ss.split(",") if p.strip()]
@@ -245,10 +274,10 @@ def fetch_all_image_urls(detail_url: str, limit: int) -> List[str]:
         return []
     return extract_image_urls(r.text, detail_url, limit=limit)
 
-# --------- Download + upload ---------
+# ---------- DOWNLOAD + UPLOAD ----------
 def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optional[str], rank: int) -> Tuple[str, Optional[int], Optional[str]]:
     """
-    Vracia: (gcs_path, http_status, error_text)
+    Returns: (gcs_path, http_status, error_text)
     """
     folder = make_folder(seq_global, listing_id)
 
@@ -268,14 +297,14 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
     filename = f"{rank:03d}{ext}"
     gcs_path = f"{BASE_PREFIX}/{folder}/{filename}"
 
-    # Duplicitný upload = preskočiť
+    # if already uploaded, skip
     if gcs_blob_exists(gcs_path):
         try: _ = resp.content
         except Exception: pass
         finally: resp.close()
         return (gcs_path, 200, None)
 
-    # Upload
+    # upload
     try:
         content = resp.content
         ctype = resp.headers.get("Content-Type")
@@ -290,7 +319,7 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
     except Exception as e:
         return ("", 200, f"gcs_upload_error:{e}")
 
-# --------- BQ: ensure table + dedup načítanie + insert ---------
+# ---------- BQ TABLES ----------
 def ensure_pk_gcs_table(table_id: str):
     schema = [
         bigquery.SchemaField("pk", "STRING", mode="REQUIRED"),
@@ -334,14 +363,14 @@ def insert_pk_gcs_rows(table_id: str, rows: List[Dict[str, Any]]):
     job.result()
     print(f"[BQ] Inserted {len(df)} rows into {table_id}.")
 
-# --------- Main ---------
+# ---------- MAIN ----------
 def main():
     if not PROJECT_ID:
         raise RuntimeError("GCP_PROJECT_ID is required.")
     if not BUCKET_NAME:
         raise RuntimeError("GCS_BUCKET is required.")
 
-    # 1) Kandidáti z listings_master
+    # candidates
     cand = fetch_candidates()
     if cand.empty:
         print("[INFO] No candidates from listings_master in lookback window.")
@@ -352,13 +381,12 @@ def main():
     table_id = f"{PROJECT_ID}.{DATASET}.{IMAGES_PK_GCS_TABLE}"
     ensure_pk_gcs_table(table_id)
 
-    # Prednačítaj existujúce páry pre dané PK, aby sme vedeli preskočiť už zapísané fotky
+    # prefetch existing pairs to dedup before insert
     pk_list = cand["pk"].astype(str).tolist()
     existing_pairs = fetch_existing_pairs(table_id, pk_list)
 
     out_records: List[Dict[str, Any]] = []
 
-    # 2) Pre každý PK stiahni VŠETKY obrázky (limit MAX_PER_LISTING)
     for _, r in cand.iterrows():
         pk = str(r.get("pk"))
         detail_url = r.get("url")
@@ -368,34 +396,19 @@ def main():
         if not pk or not detail_url:
             continue
 
-        img_urls = fetch_all_image_urls(detail_url, limit=MAX_PER_LISTING)
-        if not img_urls:
+        urls = fetch_all_image_urls(detail_url, limit=MAX_PER_LISTING)
+        if not urls:
             print(f"[WARN] no images found for pk={pk} ({detail_url})", flush=True)
             continue
 
-        rank = 0
-        for u in img_urls[:MAX_PER_LISTING]:
-            rank += 1
-            # budúca GCS URL (pre dedup s BQ): musíme vedieť gcs_path, aby sme vedeli, či pár (pk,gcs_url) už existuje
-            folder = make_folder(seq_global, listing_id)
-            ext = ".jpg"  # dočasne; finálnu príponu určíme až po HTTP response
-            gcs_path_pred = f"{BASE_PREFIX}/{folder}/{rank:03d}{ext}"
-            gcs_url_pred = f"gs://{BUCKET_NAME}/{gcs_path_pred}"
-
-            # Ak už (pk, gcs_url_pred) existuje (z predchádzajúceho behu), preskoč stiahnutie;
-            # POZOR: keďže ext môže byť iná (.webp/.png), nevieš dopredu predikovať presne.
-            # Preto dedup urobíme až po skutočnom uploade (podľa reálnej prípony).
-            # Stále však môžeme predísť duplicitnému uploade tým, že sa pozrieme na existenciu blobu
-            # s reálnou príponou po stiahnutí.
-
-            gcs_path, http_status, err = download_to_gcs(u, seq_global, listing_id, rank)
+        for i, u in enumerate(urls[:MAX_PER_LISTING], start=1):
+            gcs_path, http_status, err = download_to_gcs(u, seq_global, listing_id, i)
             if not gcs_path:
-                print(f"[WARN] pk={pk} img#{rank:03d} skip: {err or http_status}", flush=True)
+                print(f"[WARN] pk={pk} img#{i:03d} skip: {err or http_status}", flush=True)
                 continue
 
             gcs_url = f"gs://{BUCKET_NAME}/{gcs_path}"
             if (pk, gcs_url) in existing_pairs:
-                # už je zapísané v BQ – žiadny nový riadok
                 continue
 
             out_records.append({
@@ -405,15 +418,13 @@ def main():
                 "batch_date": pd.to_datetime(BATCH_YYYYMMDD, format="%Y%m%d"),
             })
 
-        # jemná pauza medzi inzerátmi (nerozhnevaj hostiteľa)
-        time.sleep(random.uniform(0.1, 0.25))
+        time.sleep(random.uniform(0.1, 0.25))  # gentle
 
     if not out_records:
         print("[INFO] Nothing downloaded/uploaded. Exiting.")
         return
 
-    # 3) Finálna deduplikácia (ak by sa beh prekrýval) a insert do BQ
-    # (pre istotu si znovu načítaj existujúce páry na subset PK)
+    # final dedup & insert
     pk_subset = sorted({rec["pk"] for rec in out_records})
     existing_pairs2 = fetch_existing_pairs(table_id, pk_subset)
     final_rows = [rec for rec in out_records if (rec["pk"], rec["gcs_url"]) not in existing_pairs2]
