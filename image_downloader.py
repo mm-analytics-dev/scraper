@@ -2,7 +2,7 @@
 """
 Images downloader (v2) -> GCS + BigQuery (PK -> GCS URL)
 
-Co robi:
+Čo robí:
 - Z BQ tab. {BQ_DATASET}.images_urls_daily vyberie kandidátov (za IMAGES_LOOKBACK_DAYS),
   zoberie max IMAGES_MAX_LISTINGS inzerátov a max IMAGES_MAX_PER_LISTING fotiek na inzerát.
 - Stiahne obrázky do GCS prefixu: images_v2/YYYYMMDD/{FOLDER}/{NNN.ext}
@@ -27,8 +27,8 @@ ENV:
 
 import os
 import re
-import json
 import time
+import json
 import math
 import random
 from datetime import datetime, timezone
@@ -41,7 +41,6 @@ from urllib3.util.retry import Retry
 
 from google.cloud import bigquery
 from google.cloud import storage
-
 
 # --------- ENV ---------
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
@@ -56,12 +55,7 @@ MAX_PER_LISTING = int(os.getenv("IMAGES_MAX_PER_LISTING", "60"))
 BATCH_DATE_ENV = os.getenv("BATCH_DATE", "").strip()
 IMAGES_PK_GCS_TABLE = os.getenv("IMAGES_PK_GCS_TABLE", "images_pk_gcs").strip()
 
-
-# --------- Helpers ---------
-def now_utc() -> pd.Timestamp:
-    return pd.Timestamp.now(tz=timezone.utc)
-
-
+# --------- Batch date / prefixes ---------
 def today_yyyymmdd_utc() -> str:
     if BATCH_DATE_ENV:
         if not re.fullmatch(r"\d{8}", BATCH_DATE_ENV):
@@ -69,10 +63,11 @@ def today_yyyymmdd_utc() -> str:
         return BATCH_DATE_ENV
     return datetime.utcnow().strftime("%Y%m%d")
 
-
 BATCH_YYYYMMDD = today_yyyymmdd_utc()
 BASE_PREFIX = f"images_v2/{BATCH_YYYYMMDD}"
 
+def now_utc() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=timezone.utc)
 
 # --------- HTTP session with retries ---------
 SESSION = requests.Session()
@@ -102,12 +97,10 @@ def rand_headers(extra=None):
     if extra: h.update(extra)
     return h
 
-
 # --------- GCS / BQ clients ---------
 bq = bigquery.Client(project=PROJECT_ID or None, location=LOCATION or None)
 gcs = storage.Client(project=PROJECT_ID or None)
 bucket = gcs.bucket(BUCKET_NAME) if BUCKET_NAME else None
-
 
 # --------- SQL pre kandidátov ---------
 SQL_CANDIDATES = """
@@ -151,12 +144,10 @@ WHERE r.rn <= @max_per
 ORDER BY r.seq_global, r.pk, r.rn
 """.replace("{{PROJECT_ID}}", PROJECT_ID).replace("{{DATASET}}", DATASET)
 
-
 def query_df(sql: str, params: List[bigquery.ScalarQueryParameter]) -> pd.DataFrame:
     job_cfg = bigquery.QueryJobConfig(query_parameters=params)
     job = bq.query(sql, job_config=job_cfg, location=LOCATION or None)
     return job.result().to_dataframe(create_bqstorage_client=False)
-
 
 def fetch_candidates() -> pd.DataFrame:
     params = [
@@ -166,14 +157,12 @@ def fetch_candidates() -> pd.DataFrame:
     ]
     return query_df(SQL_CANDIDATES, params)
 
-
 # --------- Path / naming helpers ---------
 def slugify(s: str) -> str:
     if not s: return "na"
     s = s.lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s or "na"
-
 
 def safe_int(x):
     try:
@@ -182,14 +171,12 @@ def safe_int(x):
     except Exception:
         return None
 
-
 def make_folder(seq_global: Optional[int], listing_id: Optional[str]) -> str:
     if seq_global is not None:
         if listing_id:
             return f"{seq_global:06d}_{slugify(str(listing_id))}"
         return f"{seq_global:06d}"
     return slugify(listing_id) if listing_id else "na"
-
 
 def ext_from_response(url: str, resp: requests.Response) -> str:
     ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -203,12 +190,10 @@ def ext_from_response(url: str, resp: requests.Response) -> str:
         if u.endswith(suf): return ".jpg" if suf == ".jpeg" else suf
     return ".webp"
 
-
 def gcs_blob_exists(path: str) -> bool:
     if not bucket: return False
     blob = bucket.blob(path)
     return blob.exists(client=gcs)
-
 
 # --------- Download + upload ---------
 def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optional[str], rank: int) -> Tuple[str, Optional[int], Optional[str]]:
@@ -225,8 +210,10 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
 
     if status != 200:
         ctype = resp.headers.get("Content-Type")
-        try: resp.close()
-        except: pass
+        try:
+            resp.close()
+        except Exception:
+            pass
         return ("", status, f"http_{status} ({ctype})")
 
     ext = ext_from_response(image_url, resp)
@@ -235,9 +222,12 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
 
     # Duplicitný upload = preskočiť
     if gcs_blob_exists(gcs_path):
-        try: _ = resp.content
-        except: pass
-        finally: resp.close()
+        try:
+            _ = resp.content
+        except Exception:
+            pass
+        finally:
+            resp.close()
         return (gcs_path, 200, None)
 
     # Upload
@@ -255,7 +245,6 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
     except Exception as e:
         return ("", 200, f"gcs_upload_error:{e}")
 
-
 # --------- BQ: ensure table + read existing pairs + insert new ---------
 def ensure_pk_gcs_table(table_id: str):
     schema = [
@@ -268,27 +257,30 @@ def ensure_pk_gcs_table(table_id: str):
         bq.get_table(table_id)
     except Exception:
         table = bigquery.Table(table_id, schema=schema)
-        table = bq.create_table(table)
+        bq.create_table(table)
         print(f"[BQ] Created table {table_id}.")
 
-
 def fetch_existing_pairs(table_id: str, pks: List[str]) -> Set[Tuple[str, str]]:
+    """
+    Bezpečne a rýchlo: WHERE pk IN UNNEST(@pks)
+    """
     if not pks:
         return set()
-    # Rozumné obmedzenie: dedup len v rámci dotknutých PK
-    qp = ",".join([f"'{pk.replace(\"'\", \"\\'\")}'" for pk in pks])
     sql = f"""
     SELECT pk, gcs_url
     FROM `{table_id}`
-    WHERE pk IN ({qp})
+    WHERE pk IN UNNEST(@pks)
     """
+    params = [
+        bigquery.ArrayQueryParameter("pks", "STRING", pks),
+    ]
+    job_cfg = bigquery.QueryJobConfig(query_parameters=params)
     try:
-        df = bq.query(sql, location=LOCATION or None).result().to_dataframe()
+        df = bq.query(sql, job_config=job_cfg, location=LOCATION or None).result().to_dataframe()
         return set((str(r["pk"]), str(r["gcs_url"])) for _, r in df.iterrows())
     except Exception as e:
         print(f"[WARN] fetch_existing_pairs failed (ignored): {e}")
         return set()
-
 
 def insert_pk_gcs_rows(table_id: str, rows: List[Dict[str, Any]]):
     if not rows:
@@ -297,13 +289,10 @@ def insert_pk_gcs_rows(table_id: str, rows: List[Dict[str, Any]]):
     df = pd.DataFrame(rows)
     df["downloaded_at"] = pd.to_datetime(df["downloaded_at"], utc=True)
     df["batch_date"] = pd.to_datetime(df["batch_date"]).dt.date
-    job_cfg = bigquery.LoadJobConfig(
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-    )
+    job_cfg = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_APPEND)
     job = bq.load_table_from_dataframe(df, table_id, job_config=job_cfg, location=LOCATION or None)
     job.result()
     print(f"[BQ] Inserted {len(df)} rows into {table_id}.")
-
 
 # --------- Main ---------
 def main():
@@ -346,10 +335,8 @@ def main():
                 "batch_date": pd.to_datetime(BATCH_YYYYMMDD, format="%Y%m%d"),
             })
         else:
-            # loguj chybu do konzoly, tabuľka ostáva čistá (len úspechy)
             print(f"[WARN] skip {pk} rank {rank}: {err or http_status}", flush=True)
 
-        # jemná pauza
         time.sleep(random.uniform(0.05, 0.15))
 
     if not out_records:
@@ -370,7 +357,6 @@ def main():
 
     # 4) Zapíš len nové páry (pk, gcs_url)
     insert_pk_gcs_rows(table_id, final_rows)
-
 
 if __name__ == "__main__":
     main()
