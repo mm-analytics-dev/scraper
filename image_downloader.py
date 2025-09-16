@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Images downloader (v6) -> GCS + BigQuery (PK -> public HTTPS URL)
+Images downloader (v7) -> GCS + BigQuery (PK -> public HTTPS URL)
 
-Čo robí:
-- Z {DATASET}.listings_master zoberie inzeráty (IMAGES_LOOKBACK_DAYS), max IMAGES_MAX_LISTINGS.
-- Z detailu vyparsuje VŠETKY rozumné image URL (og:image, JSON-LD, <img>, srcset, data-*).
-- Stiahne max IMAGES_MAX_PER_LISTING fotiek na inzerát.
-- Uloží do GCS: images_v2/YYYYMMDD/{SEQ}_{listing_id}/{NNN.ext}
-- Do BQ {DATASET}.{IMAGES_PK_GCS_TABLE} zapíše každý obrázok: (pk, gcs_url, downloaded_at, batch_date),
-  kde gcs_url je **verejná HTTPS URL**: https://storage.googleapis.com/<bucket>/<path>
-- Idempotentné: preskočí existujúce objekty v GCS + deduplikuje podľa (pk, HTTPS URL).
-- Kompatibilita: ak v tabuľke už sú riadky s `gs://...`, pri čítaní ich normalizuje na HTTPS,
-  takže sa berú ako rovnaké a nevzniknú duplicity.
+Zmeny oproti v6:
+- Extrakcia fotiek je zameraná na GALÉRIU:
+  * vyberá hlavný galéria kontajner (class obsahuje: gallery/carousel/swiper/slider/photo/photos alebo data-testid*='gallery')
+  * prechádza <img>, srcset a a[href] iba v rámci galérie
+  * parsuje JSON/initial-state zo <script> a vyťahuje URL fotiek (CDN hosty)
+  * filtruje URL cez _looks_like_real_image a whitelist hostov (img.unitedclassifieds.sk, img.nehnutelnosti.sk)
+  * fallback je og:image
+- Ostatné jadro (GCS upload, BQ insert s HTTPS URL) ostáva nezmenené.
 
 ENV:
   GOOGLE_APPLICATION_CREDENTIALS=./sa.json
@@ -133,20 +131,11 @@ bucket = gcs.bucket(BUCKET_NAME) if BUCKET_NAME else None
 
 # ---------- URL normalizácia ----------
 def https_url(bucket_name: str, path: str) -> str:
-    # základná public endpoint URL
     return f"https://storage.googleapis.com/{bucket_name}/{path}"
 
 def to_https_canonical(u: str) -> str:
-    """
-    Normalizuj na HTTPS public URL:
-      gs://bucket/path -> https://storage.googleapis.com/bucket/path
-      https://storage.googleapis.com/bucket/path -> (ponechaj)
-      iné formy vráť nezmenené (nemali by byť)
-    """
-    if not u:
-        return u
+    if not u: return u
     if u.startswith("gs://"):
-        # gs://bucket/...
         without = u[len("gs://"):]
         parts = without.split("/", 1)
         if len(parts) == 2:
@@ -221,64 +210,138 @@ def strip_query(u: str) -> str:
     except Exception:
         return u
 
-# ---------- PARSING ALL IMAGE URLS ----------
-def extract_image_urls(html: str, page_url: str, limit: int) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
+# ---------- Whitelist/Blacklist a heuristiky (podľa tvojho kódu) ----------
+IMG_HOST_ALLOW = ("img.unitedclassifieds.sk", "img.nehnutelnosti.sk")
+IMG_SUFFIX_ALLOW = (".jpg", ".jpeg", ".webp", ".png", ".avif", ".jfif", ".gif")
+IMG_BAD_HINTS = ("data:image/", "beacon", "pixel", "ads", "analytics")
+
+def _looks_like_real_image(url: str) -> bool:
+    if not url:
+        return False
+    u = url.lower()
+    if any(bad in u for bad in IMG_BAD_HINTS):
+        return False
+    if "data:image/" in u:
+        return False
+    if not any(h in u for h in IMG_HOST_ALLOW):
+        return False
+    if any(u.endswith(suf) for suf in IMG_SUFFIX_ALLOW):
+        return True
+    if "_fss" in u or "?st=" in u:
+        return True
+    return False
+
+# ---------- Pomocné: nájdi hlavný GALÉRIA kontajner ----------
+GALLERY_SEL = (
+    "[data-testid*='gallery'], [data-testid*='Gallery'], "
+    "[class*='gallery'], [class*='Gallery'], "
+    "[class*='carousel'], [class*='Carousel'], "
+    "[class*='swiper'], [class*='Swiper'], "
+    "[class*='slider'], [class*='Slider'], "
+    "[class*='photo'], [class*='Photo'], [class*='photos'], [class*='Photos']"
+)
+
+def _pick_best_gallery_scope(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
+    candidates = soup.select(GALLERY_SEL)
+    if not candidates:
+        return None
+    best = None
+    best_score = -1
+    for c in candidates:
+        try:
+            imgs = c.find_all("img")
+            score = len(imgs)
+        except Exception:
+            score = 0
+        if score > best_score:
+            best = c
+            best_score = score
+    return best or None
+
+# ---------- Parsovanie fotiek (iba galéria + JSON/initial-state) ----------
+IMG_URL_RE = re.compile(r"https?://[^\s\"'<>]+?\.(?:jpg|jpeg|png|webp|avif|gif)(?:\?[^\s\"'<>]*)?", re.I)
+
+def _urls_from_scripts(soup: BeautifulSoup, page_url: str, limit: int) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for sc in soup.find_all("script"):
+        payload = sc.string or sc.get_text() or ""
+        if not payload or (".jpg" not in payload and ".webp" not in payload and ".png" not in payload and ".avif" not in payload):
+            continue
+        for m in IMG_URL_RE.finditer(payload):
+            u = m.group(0)
+            if not _looks_like_real_image(u):
+                continue
+            key = strip_query(u)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(u)
+            if len(out) >= limit:
+                return out
+    return out
+
+def _urls_from_gallery_scope(gal: BeautifulSoup, page_url: str, limit: int) -> List[str]:
     out: List[str] = []
     seen: Set[str] = set()
 
     def push(u: str):
-        if not u: return
+        if not u:
+            return
         au = urljoin(page_url, u.strip())
+        if not _looks_like_real_image(au):
+            return
         key = strip_query(au)
-        if key not in seen:
-            seen.add(key)
-            out.append(au)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(au)
 
-    # og:image
-    for og in soup.find_all("meta", property="og:image"):
-        if og.get("content"): push(og["content"])
-        if len(out) >= limit: return out[:limit]
+    # <img> v rámci galérie
+    for img in gal.find_all("img"):
+        for attr in ("data-full", "data-original", "data-src", "data-lazy", "src"):
+            if img.get(attr):
+                push(img.get(attr))
+        ss = img.get("srcset") or img.get("data-srcset")
+        if ss:
+            parts = [p.strip().split(" ")[0] for p in ss.split(",") if p.strip()]
+            for u in parts:
+                push(u)
+        if len(out) >= limit:
+            return out[:limit]
 
-    # JSON-LD "image"
-    for sc in soup.find_all("script", type=lambda t: t and "ld+json" in t):
-        payload = sc.string or sc.get_text() or ""
-        if not payload.strip(): continue
-        try: data = json.loads(payload)
-        except Exception: continue
-        stack = [data]
-        while stack:
-            obj = stack.pop()
-            if isinstance(obj, dict):
-                img = obj.get("image")
-                if isinstance(img, str):
-                    push(img)
-                elif isinstance(img, list):
-                    for it in img:
-                        if isinstance(it, str):
-                            push(it)
-                for v in obj.values():
-                    if isinstance(v, (dict, list)): stack.append(v)
-            elif isinstance(obj, list):
-                stack.extend(obj)
-        if len(out) >= limit: return out[:limit]
-
-    # gallery/hero images
-    selectors = [
-        "[class*='gallery'] img", "[class*='carousel'] img", "[class*='swiper'] img",
-        "[class*='slider'] img", "[class*='image'] img", "img"
-    ]
-    for sel in selectors:
-        for img in soup.select(sel):
-            for attr in ("data-full", "data-original", "data-src", "data-lazy", "src"):
-                if img.get(attr): push(img.get(attr))
-            ss = img.get("srcset") or img.get("data-srcset")
-            if ss:
-                parts = [p.strip().split(" ")[0] for p in ss.split(",") if p.strip()]
-                for u in parts: push(u)
-            if len(out) >= limit: return out[:limit]
+    # linky v rámci galérie, ktoré smerujú priamo na obrázok (nie vždy, ale býva)
+    for a in gal.find_all("a", href=True):
+        push(a["href"])
+        if len(out) >= limit:
+            return out[:limit]
 
     return out[:limit]
+
+def extract_image_urls_from_detail(html: str, page_url: str, limit: int) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) JSON/initial-state <script> – často obsahuje kompletný zoznam fotiek z galérie
+    from_scripts = _urls_from_scripts(soup, page_url, limit)
+    if from_scripts:
+        return from_scripts[:limit]
+
+    # 2) vyber hlavný galéria scope a ťahaj iba z neho
+    gal = _pick_best_gallery_scope(soup)
+    if gal:
+        urls = _urls_from_gallery_scope(gal, page_url, limit)
+        if urls:
+            return urls[:limit]
+
+    # 3) fallback: og:image (1 kus), iba ak je z povolených hostov
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        u = urljoin(page_url, og["content"].strip())
+        if _looks_like_real_image(u):
+            return [u]
+
+    # nič
+    return []
 
 def fetch_all_image_urls(detail_url: str, limit: int) -> List[str]:
     try:
@@ -287,7 +350,7 @@ def fetch_all_image_urls(detail_url: str, limit: int) -> List[str]:
         return []
     if r.status_code != 200 or not r.text:
         return []
-    return extract_image_urls(r.text, detail_url, limit=limit)
+    return extract_image_urls_from_detail(r.text, detail_url, limit=limit)
 
 # ---------- DOWNLOAD + UPLOAD ----------
 def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optional[str], rank: int) -> Tuple[str, Optional[int], Optional[str]]:
@@ -338,7 +401,7 @@ def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optio
 def ensure_pk_gcs_table(table_id: str):
     schema = [
         bigquery.SchemaField("pk", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("gcs_url", "STRING", mode="REQUIRED"),  # bude obsahovať HTTPS public URL
+        bigquery.SchemaField("gcs_url", "STRING", mode="REQUIRED"),  # HTTPS public URL
         bigquery.SchemaField("downloaded_at", "TIMESTAMP", mode="NULLABLE"),
         bigquery.SchemaField("batch_date", "DATE", mode="NULLABLE"),
     ]
@@ -430,7 +493,6 @@ def main():
                 print(f"[WARN] pk={pk} img#{i:03d} skip: {err or http_status}", flush=True)
                 continue
 
-            # Ukladaj HTTPS URL, nie gs://
             https = https_url(BUCKET_NAME, gcs_path)
             canon = to_https_canonical(https)
 
