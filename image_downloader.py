@@ -1,53 +1,53 @@
 # -*- coding: utf-8 -*-
 """
-Images downloader (galéria) -> GCS + BigQuery (PK -> HTTPS URL na GCS)
+Images downloader (v2.2) → GCS + BigQuery (PK → HTTPS GCS URL)
 
-Co robi:
-- Z BQ tab. {DATASET}.listings_daily (fallback {DATASET}.listings_master) vezme inzeráty
-  z posledných IMAGES_LOOKBACK_DAYS podľa batch_ts/last_seen.
-- Pre každý inzerát otvorí DETAIL a nájde link na GALÉRIU (/detail/galeria/foto/…).
-- Z galérie vyparsuje všetky <img> z hostov img.nehnutelnosti.sk / img.unitedclassifieds.sk,
-  vyberie najväčší variant zo srcset, zoradí podľa alt="..._foto_XX".
-- Stiahne max IMAGES_MAX_PER_LISTING fotiek na inzerát a uloží do:
-    gs://{GCS_BUCKET}/images_v2/YYYYMMDD/{SEQ_LISTING}/NNN.ext
-  a do BQ {DATASET}.{IMAGES_PK_GCS_TABLE} zapíše:
-    pk STRING, gcs_url STRING (HTTPS!), downloaded_at TIMESTAMP, batch_date DATE
-- Dedup: neuploaduje, ak blob už existuje; pred zápisom do BQ vynechá už existujúce (pk,gcs_url).
+- Z BQ vyberie pk/listing_id/seq_global/url za posledné dni.
+- Z každého detailu vytiahne celú fotogalériu:
+    1) inline IMG/SRCSET v detaile (iba hosty img.nehnutelnosti.sk / img.unitedclassifieds.sk a len ak URL obsahuje /foto/)
+    2) ak existuje, otvorí /detail/galeria/foto/<listing_id>/ a vytiahne všetky obrázky
+    3) regexom prejde <script> bloky a dozbiera URL na fotky (len /foto/)
+- Stiahne do GCS prefixu: images_v2/YYYYMMDD/{FOLDER}/{NNN.ext}
+- Zapíše do BQ tabuľky {BQ_DATASET}.{IMAGES_PK_GCS_TABLE} páry:
+      pk STRING, gcs_url STRING (HTTPS), downloaded_at TIMESTAMP, batch_date DATE
+  (pre jeden pk môže byť veľa riadkov – 1 riadok = 1 fotka)
+- Nikdy duplicitne: pred zápisom skontroluje existujúce (pk, gcs_url).
 
-ENV (Secrets / Variables):
-  GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json
+ENV (Secrets/Variables v Actions):
+  GOOGLE_APPLICATION_CREDENTIALS=./sa.json
   GCP_PROJECT_ID=...
-  BQ_DATASET=realestate_v2              (ak máš aj BQ_DATASET_V2, zoberie sa ten)
+  BQ_DATASET=realestate_v2
   BQ_LOCATION=EU
   GCS_BUCKET=...
   IMAGES_LOOKBACK_DAYS=3
   IMAGES_MAX_LISTINGS=15
   IMAGES_MAX_PER_LISTING=60
-  BATCH_DATE=YYYYMMDD                   (optional; inak dnešný UTC)
-  IMAGES_PK_GCS_TABLE=images_pk_gcs     (optional)
+  BATCH_DATE=YYYYMMDD (optional)
+  IMAGES_PK_GCS_TABLE=images_pk_gcs (optional; default)
 """
 
 import os
 import re
-import json
 import time
+import json
+import math
 import random
-from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple, Set
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, unquote
 
 from google.cloud import bigquery
 from google.cloud import storage
 
-# ------------------ ENV ------------------
+# ---------------- ENV ----------------
 PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
-DATASET = (os.getenv("BQ_DATASET_V2") or os.getenv("BQ_DATASET") or "realestate_v2").strip()
+DATASET = os.getenv("BQ_DATASET", "realestate_v2").strip()
 LOCATION = os.getenv("BQ_LOCATION", "EU").strip()
 BUCKET_NAME = os.getenv("GCS_BUCKET", "").strip()
 
@@ -58,7 +58,10 @@ MAX_PER_LISTING = int(os.getenv("IMAGES_MAX_PER_LISTING", "60"))
 BATCH_DATE_ENV = os.getenv("BATCH_DATE", "").strip()
 IMAGES_PK_GCS_TABLE = os.getenv("IMAGES_PK_GCS_TABLE", "images_pk_gcs").strip()
 
-# ------------------ Batch date / prefix ------------------
+# ---------------- Helpers ----------------
+def now_utc() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=timezone.utc)
+
 def today_yyyymmdd_utc() -> str:
     if BATCH_DATE_ENV:
         if not re.fullmatch(r"\d{8}", BATCH_DATE_ENV):
@@ -69,7 +72,17 @@ def today_yyyymmdd_utc() -> str:
 BATCH_YYYYMMDD = today_yyyymmdd_utc()
 BASE_PREFIX = f"images_v2/{BATCH_YYYYMMDD}"
 
-# ------------------ HTTP session ------------------
+# ---------------- HTTP session ----------------
+SESSION = requests.Session()
+_retry = Retry(
+    total=4, connect=3, read=3, backoff_factor=1.2,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "HEAD"])
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=16, pool_maxsize=16)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
 UAS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
@@ -80,48 +93,73 @@ def rand_headers(extra=None):
     h = {
         "User-Agent": random.choice(UAS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "sk-SK,sk;q=0.9,cs-CZ;q=0.8,en-US;q=0.7,en;q=0.6",
+        "Accept-Language": "sk-SK,sk;q=0.9,cs;q=0.7,en-US;q=0.6,en;q=0.5",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Referer": "https://www.nehnutelnosti.sk/",
     }
-    if extra:
-        h.update(extra)
+    if extra: h.update(extra)
+    if random.random() < 0.25:
+        h["Connection"] = "close"
     return h
 
-SESSION = requests.Session()
-_retry = Retry(
-    total=4, connect=3, read=3, backoff_factor=1.2,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "HEAD"])
-)
-_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
-SESSION.mount("https://", _adapter)
-SESSION.mount("http://", _adapter)
+def http_get(url: str, timeout=30, extra_headers=None) -> requests.Response:
+    return SESSION.get(url, timeout=timeout, headers=rand_headers(extra_headers))
 
-def http_get(url: str, extra_headers=None, timeout=30) -> requests.Response:
-    return SESSION.get(url, headers=rand_headers(extra_headers), timeout=timeout)
-
-# ------------------ BQ / GCS clients ------------------
+# ---------------- GCS / BQ clients ----------------
 bq = bigquery.Client(project=PROJECT_ID or None, location=LOCATION or None)
 gcs = storage.Client(project=PROJECT_ID or None)
 bucket = gcs.bucket(BUCKET_NAME) if BUCKET_NAME else None
 
-# ------------------ Utils ------------------
-def now_utc() -> pd.Timestamp:
-    return pd.Timestamp.now(tz=timezone.utc)
+# ---------------- SQL candidates ----------------
+# primárny zdroj – meta tabuľka s URL detailu
+SQL_CANDIDATES_PRIMARY = f"""
+SELECT pk, listing_id, seq_global, url
+FROM `{PROJECT_ID}.{DATASET}.listings_meta_daily_v2`
+WHERE batch_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_days DAY)
+  AND url LIKE 'https://www.nehnutelnosti.sk/detail/%'
+QUALIFY ROW_NUMBER() OVER (PARTITION BY pk ORDER BY batch_ts DESC) = 1
+ORDER BY MIN(seq_global)
+LIMIT @max_listings
+"""
 
+# fallback – ak by primárna tab. neexistovala
+SQL_CANDIDATES_FALLBACK = f"""
+SELECT pk, listing_id, seq_global, url
+FROM `{PROJECT_ID}.{DATASET}.listings_meta_daily`
+WHERE batch_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_days DAY)
+  AND url LIKE 'https://www.nehnutelnosti.sk/detail/%'
+QUALIFY ROW_NUMBER() OVER (PARTITION BY pk ORDER BY batch_ts DESC) = 1
+ORDER BY MIN(seq_global)
+LIMIT @max_listings
+"""
+
+def query_df(sql: str, params: List[bigquery.ScalarQueryParameter]) -> pd.DataFrame:
+    job_cfg = bigquery.QueryJobConfig(query_parameters=params)
+    job = bq.query(sql, job_config=job_cfg, location=LOCATION or None)
+    return job.result().to_dataframe(create_bqstorage_client=False)
+
+def fetch_candidates() -> pd.DataFrame:
+    params = [
+        bigquery.ScalarQueryParameter("lookback_days", "INT64", LOOKBACK_DAYS),
+        bigquery.ScalarQueryParameter("max_listings", "INT64", MAX_LISTINGS),
+    ]
+    try:
+        return query_df(SQL_CANDIDATES_PRIMARY, params)
+    except Exception as e:
+        print(f"[WARN] primary candidates failed → fallback ({e})", flush=True)
+        return query_df(SQL_CANDIDATES_FALLBACK, params)
+
+# ---------------- Path / naming helpers ----------------
 def slugify(s: str) -> str:
-    if not s:
-        return "na"
+    if not s: return "na"
     s = s.lower()
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return s or "na"
 
 def safe_int(x):
     try:
-        if pd.isna(x):
-            return None
+        if pd.isna(x): return None
         return int(x)
     except Exception:
         return None
@@ -146,202 +184,220 @@ def ext_from_response(url: str, resp: requests.Response) -> str:
     return ".webp"
 
 def gcs_blob_exists(path: str) -> bool:
-    if not bucket:
-        return False
+    if not bucket: return False
     blob = bucket.blob(path)
     return blob.exists(client=gcs)
 
-# ------------------ Kandidáti z BQ ------------------
-SQL_DAILY = """
-SELECT pk, listing_id, seq_global, url
-FROM `{{PROJECT}}.{{DATASET}}.listings_daily`
-WHERE DATE(batch_ts) >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
-QUALIFY ROW_NUMBER() OVER (PARTITION BY pk ORDER BY batch_ts DESC) = 1
-ORDER BY seq_global
-LIMIT @max_listings
-""".replace("{{PROJECT}}", PROJECT_ID).replace("{{DATASET}}", DATASET)
+# ---------------- Image URL extraction ----------------
+IMG_HOST_ALLOW = ("img.nehnutelnosti.sk", "img.unitedclassifieds.sk")
+BAD_HINTS = ("logo", "sprite", "icon", "mail.", "lightbulb", "fb.", "gdpr", "analytics", "pixel")
 
-SQL_MASTER = """
-SELECT pk, listing_id, seq_global, url
-FROM `{{PROJECT}}.{{DATASET}}.listings_master`
-WHERE last_seen >= DATE_SUB(CURRENT_DATE(), INTERVAL @lookback_days DAY)
-QUALIFY ROW_NUMBER() OVER (PARTITION BY pk ORDER BY last_seen DESC) = 1
-ORDER BY seq_global
-LIMIT @max_listings
-""".replace("{{PROJECT}}", PROJECT_ID).replace("{{DATASET}}", DATASET)
-
-def query_df(sql: str, params: List[bigquery.ScalarQueryParameter]) -> pd.DataFrame:
-    job_cfg = bigquery.QueryJobConfig(query_parameters=params)
-    job = bq.query(sql, job_config=job_cfg, location=LOCATION or None)
-    return job.result().to_dataframe(create_bqstorage_client=False)
-
-def fetch_candidates() -> pd.DataFrame:
-    params = [
-        bigquery.ScalarQueryParameter("lookback_days", "INT64", LOOKBACK_DAYS),
-        bigquery.ScalarQueryParameter("max_listings", "INT64", MAX_LISTINGS),
-    ]
-    try:
-        return query_df(SQL_DAILY, params)
-    except Exception as e:
-        print(f"[WARN] listings_daily query failed, falling back to listings_master ({e})")
-        return query_df(SQL_MASTER, params)
-
-# ------------------ Galéria – parsovanie ------------------
-IMG_HOST_ALLOW = ("img.unitedclassifieds.sk", "img.nehnutelnosti.sk")
-IMG_BAD_HINTS = ("data:image/", "beacon", "pixel", "ads", "analytics")
-GALLERY_LINK_RE = re.compile(r"/detail/galeria/foto/[^\s\"'>]+", re.I)
-
-def is_good_image_url(u: str) -> bool:
-    if not u:
-        return False
-    lu = u.lower()
-    if any(b in lu for b in IMG_BAD_HINTS):
-        return False
-    # host filter (len ak máme absolútne URL)
-    try:
-        host = re.search(r"https?://([^/]+)/", lu)
-        if host:
-            h = host.group(1)
-            if not any(allow in h for allow in IMG_HOST_ALLOW):
-                return False
-    except Exception:
-        pass
-    return True
-
-def best_from_srcset(srcset: str) -> Optional[str]:
-    """
-    Vyber najväčší zdroj zo srcset (podľa w-descriptora). Ak nie je, None.
-    """
-    if not srcset:
+def absolutize(base_url: str, u: str) -> Optional[str]:
+    if not u: return None
+    absu = urljoin(base_url, u)
+    pr = urlparse(absu)
+    if not pr.scheme or not pr.netloc:
         return None
-    best_u, best_w = None, -1
-    for part in srcset.split(","):
-        p = part.strip()
-        if not p:
-            continue
-        bits = p.split()
-        url = bits[0]
-        w = -1
-        if len(bits) >= 2 and bits[1].endswith("w"):
-            try:
-                w = int(re.sub(r"\D", "", bits[1]))
-            except Exception:
-                w = -1
-        if w > best_w:
-            best_w, best_u = w, url
-    return best_u
+    return absu
 
-def find_gallery_url(detail_url: str, detail_html: str) -> Optional[str]:
-    soup = BeautifulSoup(detail_html, "html.parser")
-    a = soup.find("a", href=GALLERY_LINK_RE)
+def is_real_photo(u: str) -> bool:
+    try:
+        pr = urlparse(u)
+        host_ok = any(h in pr.netloc for h in IMG_HOST_ALLOW)
+        path = (pr.path or "").lower()
+        if not host_ok: return False
+        if "/foto/" not in path: return False
+        if any(b in path for b in BAD_HINTS): return False
+        return True
+    except Exception:
+        return False
+
+def pick_best_from_srcset(srcset: str, base_url: str) -> Optional[str]:
+    # "url1 300w, url2 600w, url3 1200w"
+    best = None; bestw = -1
+    for part in srcset.split(","):
+        tok = part.strip().split()
+        if not tok: continue
+        u = absolutize(base_url, tok[0])
+        if not u: continue
+        w = -1
+        if len(tok) > 1 and tok[1].endswith("w"):
+            try: w = int(tok[1][:-1])
+            except: w = -1
+        if w > bestw:
+            bestw = w; best = u
+    return best
+
+SCRIPT_IMG_RE = re.compile(
+    r"https?://(?:img\.nehnutelnosti\.sk|img\.unitedclassifieds\.sk)/[^\s\"'<>]+",
+    re.I
+)
+
+def collect_inline_photos(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    # <img>
+    for img in soup.find_all("img"):
+        # prefer srcset (najväčší)
+        srcset = img.get("srcset") or img.get("data-srcset") or ""
+        if srcset:
+            u = pick_best_from_srcset(srcset, base_url)
+            if u and is_real_photo(u): out.append(u)
+        for attr in ("src", "data-src", "data-original", "data-lazy"):
+            u = absolutize(base_url, img.get(attr))
+            if u and is_real_photo(u): out.append(u)
+    # <source srcset>
+    for src in soup.find_all("source"):
+        srcset = src.get("srcset") or src.get("data-srcset")
+        if srcset:
+            u = pick_best_from_srcset(srcset, base_url)
+            if u and is_real_photo(u): out.append(u)
+    # odkazy priamo na obrázky (zriedka)
+    for a in soup.find_all("a", href=True):
+        u = absolutize(base_url, a["href"])
+        if u and is_real_photo(u): out.append(u)
+    # zo skriptov (iba veľké fotky z /foto/)
+    in_scripts = SCRIPT_IMG_RE.findall(html or "")
+    for u in in_scripts:
+        if is_real_photo(u): out.append(u)
+    # dedup – zachovať poradie
+    uniq = []
+    seen = set()
+    for u in out:
+        key = u.split("?")[0]   # bez query pre lepší dedup
+        if key not in seen:
+            seen.add(key); uniq.append(u)
+    return uniq
+
+def find_gallery_link(html: str, base_url: str, listing_id: Optional[str]) -> Optional[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    # priama kotva
+    a = soup.find("a", href=re.compile(r"/detail/galeria/foto/", re.I))
     if a and a.get("href"):
-        return urljoin(detail_url, a.get("href"))
-    m = GALLERY_LINK_RE.search(detail_html or "")
-    if m:
-        return urljoin(detail_url, m.group(0))
+        return absolutize(base_url, a["href"])
+    # fallback cez pattern s listing_id
+    if listing_id:
+        cand = f"/detail/galeria/foto/{listing_id}/"
+        return absolutize(base_url, cand)
     return None
 
-def extract_gallery_images(gallery_html: str) -> List[str]:
-    """
-    Zober všetky <img> z galérie, preferuj najväčší variant zo srcset, zorad podľa alt _foto_N.
-    """
-    soup = BeautifulSoup(gallery_html, "html.parser")
-    items: List[Tuple[int, str]] = []
+def extract_all_photos(detail_url: str, listing_id: Optional[str]) -> List[str]:
+    photos: List[str] = []
 
-    def order_from_img(img) -> int:
-        alt = (img.get("alt") or "")
-        m = re.search(r"_foto_(\d+)", alt)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-        return 10**9
+    # 1) detail
+    r = http_get(detail_url)
+    if r.status_code != 200:
+        print(f"[WARN] detail HTTP {r.status_code}: {detail_url}", flush=True)
+        return photos
+    html = r.text
 
-    # <img> s povolenými hostami
-    for img in soup.find_all("img"):
-        srcset = (img.get("srcset") or "").strip()
-        src = (img.get("src") or img.get("data-src") or "").strip()
-        cand = best_from_srcset(srcset) or src
-        if not is_good_image_url(cand):
-            continue
-        items.append((order_from_img(img), cand))
+    # inline
+    photos.extend(collect_inline_photos(html, detail_url))
 
-    # prípadné <a href="..."> s priamymi linkami
-    for a in soup.find_all("a", href=True):
-        u = a["href"].strip()
-        if is_good_image_url(u):
-            child = a.find("img")
-            order = order_from_img(child) if child else 10**9
-            items.append((order, u))
+    # 2) galéria (ak vieme link)
+    gal_url = find_gallery_link(html, detail_url, listing_id)
+    if gal_url:
+        try:
+            rg = http_get(gal_url, extra_headers={"Accept": "text/html"})
+            if rg.status_code == 200:
+                photos.extend(collect_inline_photos(rg.text, gal_url))
+            else:
+                print(f"[WARN] gallery HTTP {rg.status_code}: {gal_url}", flush=True)
+        except Exception as e:
+            print(f"[WARN] gallery fetch error {gal_url} -> {e}", flush=True)
+    else:
+        print(f"[WARN] gallery link not found: {detail_url}", flush=True)
 
-    # zoradenie + dedup + rozbalenie _next/image url parametra ?url=
-    items.sort(key=lambda x: x[0])
-    seen: Set[str] = set()
-    out: List[str] = []
-    for _, u in items:
-        if "/_next/image" in u and "url=" in u:
-            try:
-                inner = re.search(r"[?&]url=([^&]+)", u).group(1)
-                u = unquote(inner)
-            except Exception:
-                pass
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    # dedup + max per listing
+    uniq = []
+    seen = set()
+    for u in photos:
+        # prefer „väčšiu“ verziu – ak má query param w=..., môžeme zvýšiť na 1600
+        try:
+            pr = urlparse(u)
+            q = dict(parse_qsl(pr.query))
+            if "w" in q:
+                try:
+                    w = int(q["w"])
+                    if w < 1600:
+                        q["w"] = "1600"
+                        pr = pr._replace(query=urlencode(q))
+                        u = urlunparse(pr)
+                except: pass
+        except: pass
 
-# ------------------ Download + upload ------------------
-def download_to_gcs(image_url: str, seq_global: Optional[int], listing_id: Optional[str], rank: int) -> Tuple[str, Optional[int], Optional[str]]:
-    """
-    Vracia: (gcs_path, http_status, error_text)
-    """
-    folder = make_folder(seq_global, listing_id)
+        key = u.split("?")[0]
+        if key not in seen:
+            seen.add(key); uniq.append(u)
+        if len(uniq) >= MAX_PER_LISTING:
+            break
+    return uniq
 
+# ---------------- Download + upload ----------------
+def https_gcs_url(path: str) -> str:
+    # https URL použiteľná v BQ/Lookeri
+    return f"https://storage.googleapis.com/{BUCKET_NAME}/{path}"
+
+def download_one(image_url: str, gcs_path: str) -> Tuple[bool, Optional[str]]:
+    """Vracia (success, error_text)."""
+    if gcs_blob_exists(gcs_path):
+        return True, None
     try:
-        resp = http_get(image_url, extra_headers={"Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}, timeout=40)
+        resp = SESSION.get(image_url, timeout=35, headers=rand_headers({"Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}), stream=True)
         status = int(resp.status_code)
     except Exception as e:
-        return ("", None, f"request_error:{e}")
-
+        return False, f"request_error:{e}"
     if status != 200:
-        try:
-            resp.close()
-        except Exception:
-            pass
-        return ("", status, f"http_{status}")
-
-    ext = ext_from_response(image_url, resp)
-    filename = f"{rank:03d}{ext}"
-    gcs_path = f"{BASE_PREFIX}/{folder}/{filename}"
-
-    if gcs_blob_exists(gcs_path):
-        try:
-            _ = resp.content
-        finally:
-            resp.close()
-        return (gcs_path, 200, None)
-
+        try: resp.close()
+        except: pass
+        return False, f"http_{status}"
     try:
         content = resp.content
         ctype = resp.headers.get("Content-Type")
     finally:
         resp.close()
-
     try:
         blob = bucket.blob(gcs_path)
-        blob.cache_control = "public, max-age=31536000"
         blob.upload_from_string(content, content_type=ctype)
-        print(f"[OK] gs://{BUCKET_NAME}/{gcs_path}", flush=True)
-        return (gcs_path, 200, None)
+        return True, None
     except Exception as e:
-        return ("", 200, f"gcs_upload_error:{e}")
+        return False, f"gcs_upload_error:{e}"
 
-# ------------------ BQ tabuľka (pk -> https url) ------------------
+def download_listing_images(pk: str, seq_global: Optional[int], listing_id: Optional[str], detail_url: str) -> List[str]:
+    urls = extract_all_photos(detail_url, listing_id)
+    if not urls:
+        return []
+    folder = make_folder(seq_global, listing_id)
+    saved_https_urls: List[str] = []
+    rank = 1
+    for u in urls:
+        # názov podľa poradia + detekcia prípony
+        # najprv si „nasucho“ zistíme príponu GET headerom? – urobíme inline pri prvom requeste
+        ext = ".webp"
+        # aby sme vedeli názov hneď, skúsime uhádnuť z URL
+        low = u.lower().split("?", 1)[0]
+        for sfx in (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif"):
+            if low.endswith(sfx):
+                ext = ".jpg" if sfx == ".jpeg" else sfx
+                break
+        gcs_path = f"{BASE_PREFIX}/{folder}/{rank:03d}{ext}"
+        ok, err = download_one(u, gcs_path)
+        if ok:
+            saved_https_urls.append(https_gcs_url(gcs_path))
+            rank += 1
+        else:
+            print(f"[WARN] skip {pk} img ({err})", flush=True)
+        # jemná pauza
+        time.sleep(random.uniform(0.05, 0.12))
+        if rank > MAX_PER_LISTING:
+            break
+    return saved_https_urls
+
+# ---------------- BQ: ensure table + insert ----------------
 def ensure_pk_gcs_table(table_id: str):
     schema = [
         bigquery.SchemaField("pk", "STRING", mode="REQUIRED"),
-        bigquery.SchemaField("gcs_url", "STRING", mode="REQUIRED"),  # HTTPS
+        bigquery.SchemaField("gcs_url", "STRING", mode="REQUIRED"),
         bigquery.SchemaField("downloaded_at", "TIMESTAMP", mode="NULLABLE"),
         bigquery.SchemaField("batch_date", "DATE", mode="NULLABLE"),
     ]
@@ -349,17 +405,17 @@ def ensure_pk_gcs_table(table_id: str):
         bq.get_table(table_id)
     except Exception:
         table = bigquery.Table(table_id, schema=schema)
-        _ = bq.create_table(table)
+        table = bq.create_table(table)
         print(f"[BQ] Created table {table_id}.")
 
 def fetch_existing_pairs(table_id: str, pks: List[str]) -> Set[Tuple[str, str]]:
     if not pks:
         return set()
-    qp = ",".join(["'{}'".format(pk.replace("'", "\\'")) for pk in pks])
+    qp = ",".join([f"'{pk.replace(\"'\", \"\\'\")}'" for pk in pks])
     sql = f"SELECT pk, gcs_url FROM `{table_id}` WHERE pk IN ({qp})"
     try:
         df = bq.query(sql, location=LOCATION or None).result().to_dataframe()
-        return set((str(r["pk"]), str(r["gcs_url"])) for _, r in df.iterrows())
+        return set((str(r['pk']), str(r['gcs_url'])) for _, r in df.iterrows())
     except Exception as e:
         print(f"[WARN] fetch_existing_pairs failed (ignored): {e}")
         return set()
@@ -376,96 +432,48 @@ def insert_pk_gcs_rows(table_id: str, rows: List[Dict[str, Any]]):
     job.result()
     print(f"[BQ] Inserted {len(df)} rows into {table_id}.")
 
-# ------------------ Hlavná logika ------------------
+# ---------------- Main ----------------
 def main():
     if not PROJECT_ID:
         raise RuntimeError("GCP_PROJECT_ID is required.")
     if not BUCKET_NAME:
         raise RuntimeError("GCS_BUCKET is required.")
 
-    # 1) kandidáti z BQ
     cand = fetch_candidates()
     if cand.empty:
-        print("[INFO] No listings in lookback window.")
+        print("[INFO] No candidates (check lookback/limits).")
         return
 
+    # stabilné poradie, dedup pk
     cand = (
         cand
         .drop_duplicates(subset=["pk"], keep="first")
         .sort_values(["seq_global", "pk"], kind="stable")
-        .head(MAX_LISTINGS)
     )
 
     out_records: List[Dict[str, Any]] = []
 
-    for _, row in cand.iterrows():
-        pk = str(row.get("pk"))
-        listing_id = row.get("listing_id")
-        seq_global = safe_int(row.get("seq_global"))
-        detail_url = row.get("url")
-
+    for _, r in cand.iterrows():
+        pk = str(r.get("pk"))
+        listing_id = r.get("listing_id")
+        seq_global = safe_int(r.get("seq_global"))
+        detail_url = r.get("url")
         if not pk or not detail_url:
             continue
 
-        # 2) detail -> nájdi link na galériu
-        try:
-            r = http_get(detail_url, timeout=40)
-            if r.status_code != 200 or not r.text:
-                print(f"[WARN] detail HTTP {r.status_code}: {detail_url}")
-                continue
-            detail_html = r.text
-        except Exception as e:
-            print(f"[WARN] detail error {detail_url} -> {e}")
-            continue
-
-        gallery_url = find_gallery_url(detail_url, detail_html)
-        if not gallery_url:
-            print(f"[WARN] gallery link not found: {detail_url}")
-            continue
-
-        # 3) galéria -> všetky obrázky
-        try:
-            gr = http_get(gallery_url, timeout=40)
-            if gr.status_code != 200 or not gr.text:
-                print(f"[WARN] gallery HTTP {gr.status_code}: {gallery_url}")
-                continue
-            image_urls = extract_gallery_images(gr.text)
-        except Exception as e:
-            print(f"[WARN] gallery error {gallery_url} -> {e}")
-            continue
-
-        if not image_urls:
-            print(f"[INFO] no images in gallery: {gallery_url}")
-            continue
-
-        # 4) sťahuj & uploaduj max per listing
-        used = 0
-        rank = 1
-        for u in image_urls:
-            if used >= MAX_PER_LISTING:
-                break
-            gcs_path, http_status, err = download_to_gcs(u, seq_global, listing_id, rank)
-            rank += 1
-            if gcs_path:
-                https_url = f"https://storage.googleapis.com/{BUCKET_NAME}/{gcs_path}"
-                out_records.append({
-                    "pk": pk,
-                    "gcs_url": https_url,  # HTTPS požadovaný
-                    "downloaded_at": now_utc(),
-                    "batch_date": pd.to_datetime(BATCH_YYYYMMDD, format="%Y%m%d"),
-                })
-                used += 1
-            else:
-                print(f"[WARN] skip {pk} img ({err or http_status})")
-
-        # mierna pauza medzi inzerátmi
-        time.sleep(random.uniform(0.15, 0.45))
+        saved_https = download_listing_images(pk, seq_global, listing_id, detail_url)
+        for https_url in saved_https:
+            out_records.append({
+                "pk": pk,
+                "gcs_url": https_url,
+                "downloaded_at": now_utc(),
+                "batch_date": pd.to_datetime(BATCH_YYYYMMDD, format="%Y%m%d"),
+            })
 
     if not out_records:
         print("[INFO] Nothing downloaded/uploaded. Exiting.")
         return
 
-    # 5) Dedup pred zápisom do BQ
     table_id = f"{PROJECT_ID}.{DATASET}.{IMAGES_PK_GCS_TABLE}"
     ensure_pk_gcs_table(table_id)
 
@@ -473,8 +481,6 @@ def main():
     existing = fetch_existing_pairs(table_id, pks)
 
     final_rows = [rec for rec in out_records if (rec["pk"], rec["gcs_url"]) not in existing]
-
-    # 6) Insert
     insert_pk_gcs_rows(table_id, final_rows)
 
 if __name__ == "__main__":
