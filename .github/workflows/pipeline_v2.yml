@@ -87,23 +87,18 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas pandas-gbq google-cloud-bigquery \
-                      google-cloud-storage pyarrow db-dtypes
-
+          pip install requests pandas google-cloud-storage google-cloud-bigquery pyarrow db-dtypes
       - name: Write service account key
         shell: bash
         run: echo "$GCP_SA_KEY" > sa.json
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-
       - name: Run image_downloader.py
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
@@ -111,4 +106,11 @@ jobs:
           BQ_DATASET: ${{ secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+          # ---- limity natvrdo pre testovanie ----
+          IMAGES_LOOKBACK_DAYS: '3'
+          IMAGES_MAX_LISTINGS: '10'
+          IMAGES_MAX_PER_LISTING: '60'
+          # Jednorazovo necháš takto a potom vymažeš:
+          # IMAGES_TABLE_RECREATE: 'true'
         run: python image_downloader.py
+
