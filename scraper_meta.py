@@ -19,9 +19,9 @@ ENV premenné očakávané v GHA:
   WORKSPACE_HOME=...              (iba pre xlsx debug)
   GOOGLE_APPLICATION_CREDENTIALS=./sa.json (píše ho job z GitHub Secrets)
 
-Poznámka: kód je tvoja verzia s minimálnymi zásahmi — jediné zmeny sú:
-  1) odstránené sťahovanie obrázkov, namiesto toho sa URL-ky posielajú do BQ tab. images_urls_daily
-  2) doplnený upload do BQ pre master/daily/images_urls_daily
+Poznámka: kód je tvoja verzia s minimálnymi zásahmi — zmeny:
+  1) deterministická deduplikácia URL obrázkov (zachovanie poradia) kvôli stabilným rankom,
+  2) drobné kozmetické safe-guardy.
 """
 
 import os, re, time, json, random, math, unicodedata
@@ -35,8 +35,8 @@ from bs4 import BeautifulSoup
 import pandas as pd
 
 # ----------------- ENV / v2 BQ prepínače -----------------
-SAVE_EXCEL   = os.getenv("SAVE_EXCEL", "false").lower() == "true"
-BQ_ENABLE    = os.getenv("BQ_ENABLE", "true").lower() == "true"
+SAVE_EXCEL     = os.getenv("SAVE_EXCEL", "false").lower() == "true"
+BQ_ENABLE      = os.getenv("BQ_ENABLE", "true").lower() == "true"
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 BQ_DATASET     = os.getenv("BQ_DATASET", "realestate_v2")
 BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
@@ -44,8 +44,8 @@ BQ_LOCATION    = os.getenv("BQ_LOCATION", "EU")
 # ----------------- Nastavenia -----------------
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj"
 
-MAX_PAGES = 1                # koľko strán výsledkov prejsť
-MAX_LINKS_PER_PAGE = 15     # maximum unikátnych inzerátov z 1 stránky
+MAX_PAGES = 1                 # koľko strán výsledkov prejsť
+MAX_LINKS_PER_PAGE = 15       # maximum unikátnych inzerátov z 1 stránky
 MAX_LISTINGS_TOTAL = None     # celkový strop (None = bez limitu)
 
 REQ_TIMEOUT = 25
@@ -61,7 +61,7 @@ BASE_NAME     = "nehnutelnosti_liptovsky_mikulas_okres"
 MASTER_XLSX   = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_master.xlsx")
 SNAPSHOT_DIR  = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_snapshots")
 DEBUG_DIR     = os.path.join(WORKSPACE_HOME, f"{BASE_NAME}_debug")
-IMAGES_DIR    = os.path.join(WORKSPACE_HOME, "inzeraty")  # už sa nepoužíva, nechávam pre spätnú kompatibilitu
+IMAGES_DIR    = os.path.join(WORKSPACE_HOME, "inzeraty")  # legacy; nepoužíva sa
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -594,24 +594,32 @@ def _looks_like_real_image(url: str) -> bool:
     return False
 
 def extract_image_urls(soup: BeautifulSoup):
-    urls = set()
+    """Zber URL -> zachovať poradie, deduplikovať (stabilné ranky)."""
+    seen = set()
+    out = []
+
+    def _add(u: str):
+        if not u: return
+        if _looks_like_real_image(u) and u not in seen:
+            seen.add(u)
+            out.append(u)
+
     for img in soup.find_all("img"):
         for attr in ("src","data-src","data-original","data-lazy"):
-            u = img.get(attr)
-            if u and _looks_like_real_image(u): urls.add(u)
+            _add(img.get(attr))
         srcset = img.get("srcset") or ""
         if srcset:
             for part in srcset.split(","):
-                u = part.strip().split(" ")[0]
-                if u and _looks_like_real_image(u): urls.add(u)
+                _add(part.strip().split(" ")[0])
+
     for sel in ["meta[property='og:image']","meta[name='twitter:image']"]:
         for m in soup.select(sel):
-            u = m.get("content")
-            if u and _looks_like_real_image(u): urls.add(u)
+            _add(m.get("content"))
+
     for a in soup.find_all("a", href=True):
-        u = a["href"]
-        if _looks_like_real_image(u): urls.add(u)
-    return list(urls)
+        _add(a["href"])
+
+    return out
 
 # ----------------- História cien -----------------
 def _nan_to_none(x):
@@ -777,8 +785,8 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
         if s_norm in LM_OBCE_NORM or s_norm == norm_txt(obec):
             street = None
 
-    # Obrázky – len URL (sťahovanie rieši iný job)
-    image_urls = [u for u in extract_image_urls(soup) if _looks_like_real_image(u)]
+    # Obrázky – len URL (sťahovanie rieši iný job) – poradie zachované
+    image_urls = extract_image_urls(soup)
 
     return {
         # KEYS
@@ -962,7 +970,7 @@ def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame, images_urls
         {"name":"days_listed","type":"INT64"},
         {"name":"active","type":"BOOL"},
         {"name":"inactive_since","type":"DATE"},
-        {"name":"scraped_at","type":"STRING"},  # string (už uložené ako lokal time)
+        {"name":"scraped_at","type":"STRING"},
     ]
 
     # DAILY
@@ -1021,7 +1029,7 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
 
     total_added = 0
     list_type_hints = {}
-    images_rows = []  # <- staging riadky pre images_urls_daily
+    images_rows = []  # staging riadky pre images_urls_daily
 
     print(f"➡️  CRAWL: {base_url}", flush=True)
 
@@ -1135,7 +1143,7 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
                     if k in master.columns:
                         master.at[i, k] = v
 
-                # namiesto sťahovania obrázkov – uložíme URL do stagingu
+                # namiesto sťahovania obrázkov – uložíme URL do stagingu (rank podľa poradia)
                 seq_global_val = int(master.at[i, "seq_global"]) if pd.notna(master.at[i, "seq_global"]) else None
                 listing_id_val = rec.get("listing_id")
                 rank = 1
@@ -1207,8 +1215,11 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
 
     # upload do BQ (v2)
     images_df = pd.DataFrame(images_rows, columns=["pk","listing_id","seq_global","url","image_url","image_rank"])
-    upload_to_bigquery(master.drop(columns=["seen_today"], errors="ignore"), snap.drop(columns=["seen_today"], errors="ignore"), images_df)
+    upload_to_bigquery(
+        master.drop(columns=["seen_today"], errors="ignore"),
+        snap.drop(columns=["seen_today"], errors="ignore"),
+        images_df
+    )
 
 if __name__ == "__main__":
     crawl_to_excel()
-
