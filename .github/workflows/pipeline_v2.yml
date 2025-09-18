@@ -1,4 +1,4 @@
-name: Pipeline v2 (meta → GPS → images)
+name: Pipeline v2 (meta → GPS → images) 
 
 on:
   schedule:
