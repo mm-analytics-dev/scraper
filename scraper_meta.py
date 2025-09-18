@@ -2,19 +2,11 @@
 """
 Real-estate scraper -> Excel (master + denné snapshoty) + popis + vlastnosti
 
-ÚPRAVA:
-* ÚPLNE odstránené: akékoľvek zbieranie / staging URL obrázkov.
-* Garantovaná unikátnosť PK: aktualizácia záznamu podľa 'pk' + finálne drop_duplicates.
-* BigQuery: bez images_urls_daily; master (REPLACE), daily (APPEND).
-
-ENV premenné očakávané v GHA:
-BQ_ENABLE=true|false            (default true)
-GCP_PROJECT_ID=...
-BQ_DATASET=realestate_v2
-BQ_LOCATION=EU
-SAVE_EXCEL=true|false           (default false)
-WORKSPACE_HOME=...              (iba pre xlsx debug)
-GOOGLE_APPLICATION_CREDENTIALS=./sa.json (píše ho job z GitHub Secrets)
+ZMENY:
+- Robustnejší HTTP retry/backoff pre detaily.
+- Fallback na Playwright pri neúspechu requests (500/429/403/časovač).
+- Garantovaná unikátnosť podľa 'pk' + drop_duplicates pred exportom.
+- BQ upload ako predtým (master REPLACE, daily APPEND).
 """
 
 import os, re, time, json, random, math, unicodedata
@@ -35,16 +27,19 @@ GCP_PROJECT_ID  = os.getenv("GCP_PROJECT_ID", "")
 BQ_DATASET      = os.getenv("BQ_DATASET", "realestate_v2")
 BQ_LOCATION     = os.getenv("BQ_LOCATION", "EU")
 
+# Playwright fallback (ak je dostupný v prostredí)
+USE_PLAYWRIGHT_FALLBACK = os.getenv("USE_PLAYWRIGHT_FALLBACK", "true").lower() == "true"
+
 # ----------------- Nastavenia -----------------
 
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj"
 
 MAX_PAGES = 1                 # koľko strán výsledkov prejsť
-MAX_LINKS_PER_PAGE = 2       # maximum unikátnych inzerátov z 1 stránky
-MAX_LISTINGS_TOTAL = None      # celkový strop (None = bez limitu)
+MAX_LINKS_PER_PAGE = 2        # maximum unikátnych inzerátov z 1 stránky
+MAX_LISTINGS_TOTAL = None     # celkový strop (None = bez limitu)
 
 REQ_TIMEOUT = 25
-PAUSE = (1.3, 3.6)
+PAUSE = (1.0, 2.2)            # jemnejšie pauzy (menšie bursty)
 VERBOSE = True
 PROGRESS_EVERY = 1
 
@@ -90,7 +85,11 @@ KEY_OBJEKT  = ("objekt","polyfunk", "administratív", "administrativ", "komerčn
 # ----------------- Obce LM -----------------
 
 LM_OBCE = [
-    "Liptovský Mikuláš","Liptovský Hrádok","Beňadiková","Bobrovček","Bobrovec","Bobrovník","Bukovina","Demänovská Dolina","Dúbrava","Galovany","Gôtovany","Huty","Hybe","Ižipovce","Jakubovany","Jalovec","Jamník","Konská","Kráľova Lehota","Kvačany","Lazisko","Liptovská Anna","Liptovská Kokava","Liptovská Porúbka","Liptovská Sielnica","Liptovské Beharovce","Liptovské Kľačany","Liptovské Matiašovce","Liptovský Ján","Liptovský Ondrej","Liptovský Peter","Liptovský Trnovec","Ľubeľa","Malatíny","Malé Borové","Malužiná","Nižná Boca","Partizánska Ľupča","Pavčina Lehota","Pavlova Ves","Podtureň","Pribylina","Prosiek","Smrečany","Svätý Kríž","Trstené","Uhorská Ves","Vavrišovo","Važec","Veľké Borové","Veterná Poruba","Vlachy","Východná","Vyšná Boca","Závažná Poruba","Žiar"
+    "Liptovský Mikuláš","Liptovský Hrádok","Beňadiková","Bobrovček","Bobrovec","Bobrovník","Bukovina","Demänovská Dolina","Dúbrava","Galovany","Gôtovany","Huty","Hybe","Ižipovce","Jakubovany","Jalovec","Jamník","Konská","Kráľova Lehota","Kvačany","Lazisko",
+    "Liptovská Anna","Liptovská Kokava","Liptovská Porúbka","Liptovská Sielnica","Liptovské Beharovce","Liptovské Kľačany","Liptovské Matiašovce",
+    "Liptovský Ján","Liptovský Ondrej","Liptovský Peter","Liptovský Trnovec","Ľubeľa","Malatíny","Malé Borové","Malužiná","Nižná Boca",
+    "Partizánska Ľupča","Pavčina Lehota","Pavlova Ves","Podtureň","Pribylina","Prosiek","Smrečany","Svätý Kríž","Trstené","Uhorská Ves",
+    "Vavrišovo","Važec","Veľké Borové","Veterná Poruba","Vlachy","Východná","Vyšná Boca","Závažná Poruba","Žiar"
 ]
 LM_OBCE_NORM = { unicodedata.normalize("NFKD", o).encode("ascii","ignore").decode().lower(): o for o in LM_OBCE }
 
@@ -127,13 +126,17 @@ ACCEPT_LANGS = [
     "cs-CZ,sk;q=0.9,en-US;q=0.7,en;q=0.6",
     "en-US,en;q=0.9,sk;q=0.8,cs;q=0.7",
 ]
+
 def rand_headers(extra=None):
     h = {
         "User-Agent": random.choice(UAS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": random.choice(ACCEPT_LANGS),
-        "Cache-Control": "no-cache", "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "Referer": "https://www.nehnutelnosti.sk/",
+        "Upgrade-Insecure-Requests": "1",
+        "Accept-Encoding": "gzip, deflate, br",
     }
     if extra: h.update(extra)
     if random.random() < 0.3:
@@ -142,9 +145,13 @@ def rand_headers(extra=None):
 
 def new_session():
     s = requests.Session()
-    retry = Retry(total=4, connect=3, read=3, backoff_factor=1.2,
-                  status_forcelist=(429,500,502,503,504),
-                  allowed_methods=frozenset(["GET","HEAD"]))
+    retry = Retry(
+        total=6, connect=3, read=3, backoff_factor=1.6,
+        status_forcelist=(429,500,502,503,504),
+        allowed_methods=frozenset(["GET","HEAD"]),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     s.mount("https://", adapter); s.mount("http://", adapter)
     return s
@@ -152,10 +159,19 @@ def new_session():
 def sleep_a_bit(): time.sleep(random.uniform(*PAUSE))
 
 def get(session: requests.Session, url: str, extra_headers=None) -> requests.Response:
-    for attempt in range(5):
-        r = session.get(url, headers=rand_headers(extra_headers), timeout=REQ_TIMEOUT)
-        if r.status_code in (429, 503) and attempt < 4:
-            time.sleep((2 ** attempt) + random.random()); continue
+    # vlastný loop s exponential backoff (nad rámec urllib3 Retry)
+    delay = 0.7
+    for attempt in range(1, 6+1):
+        try:
+            r = session.get(url, headers=rand_headers(extra_headers), timeout=REQ_TIMEOUT, allow_redirects=True)
+        except Exception:
+            if attempt >= 6: raise
+            time.sleep(delay + random.random()*0.4); delay *= 1.5
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            if attempt >= 6: return r
+            time.sleep(delay + random.random()*0.4); delay *= 1.5
+            continue
         return r
     return r
 
@@ -164,6 +180,65 @@ def save_debug(html: str, name: str):
     with open(path, "w", encoding="utf-8") as f: f.write(html)
     if VERBOSE: print(f"[DEBUG] uložené HTML: {path}", flush=True)
     return path
+
+# ----------------- Playwright fallback -----------------
+
+_pw = {"ready": False, "playwright": None, "browser": None, "context": None, "page": None}
+
+def _pw_start():
+    if _pw["ready"]: return
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+    ctx = browser.new_context(locale="sk-SK",
+                              user_agent=random.choice(UAS))
+    page = ctx.new_page()
+    _pw.update({"ready": True, "playwright": pw, "browser": browser, "context": ctx, "page": page})
+
+def _pw_stop():
+    if not _pw["ready"]: return
+    try:
+        _pw["context"].close()
+        _pw["browser"].close()
+        _pw["playwright"].stop()
+    finally:
+        _pw.update({"ready": False, "playwright": None, "browser": None, "context": None, "page": None})
+
+def fetch_html_with_fallback(url: str, session: requests.Session) -> str:
+    """Primárne requests; pri 500/429/403 alebo prázdnom tele fallback cez Playwright (ak dostupný a povolený)."""
+    r = get(session, url)
+    if r.status_code == 200 and (r.text or "").strip():
+        return r.text
+
+    if r.status_code in (429,403,500,502,503,504) and USE_PLAYWRIGHT_FALLBACK:
+        try:
+            _pw_start()
+            page = _pw["page"]
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # cookie banner
+            try:
+                btn = page.get_by_role("button", name=re.compile("Súhlasím|Prijať|Accept|I agree", re.I))
+                if btn.count() > 0:
+                    btn.first.click(timeout=2000)
+            except Exception:
+                pass
+            # malý lazy scroll – niekedy doplní DOM
+            last_h = -1
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
+                page.wait_for_timeout(400)
+                h = page.evaluate("document.body.scrollHeight")
+                if h == last_h: break
+                last_h = h
+            html = page.content()
+            if html and len(html) > 1000:
+                return html
+        except Exception:
+            # ak zlyhá aj playwright, vráť aspoň text/None (nech sa zaloguje detail fail)
+            pass
+
+    # requests fallback – vráť čo je (aj keby to bolo prázdne), nech sa to zaloguje
+    return r.text or ""
 
 # ----------------- Linky (unikátne podľa listing_id) -----------------
 
@@ -473,7 +548,7 @@ def _from_scripts_initial_state(soup: BeautifulSoup):
             pattern = r'"%s"\s*:\s*"(.*?)"' % re.escape(key)
             for m in re.finditer(pattern, payload, re.I | re.S):
                 val = m.group(1)
-                val = val.replace('\\"','"').replace("\n","\n").replace("\r"," ").replace("\t"," ")
+                val = val.replace('\\"','"').replace("\\n","\n").replace("\\r"," ").replace("\\t"," ")
                 val = _clean_description_text(val)
                 if len(val) > len(best): best = val
     return best or None
@@ -614,10 +689,9 @@ def append_history_if_changed(row_dict, today_state: dict):
 
 def _num_from_text_m(text: str):
     if not text: return None
-    # napr. "šírka 18 m", "18m", "18 m"
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*m\b", text.replace("\u00A0"," "), flags=re.I)
     if not m:
-        m = re.search(r"(\d+(?:[.,]\d+)?)\s*$", text)  # fallback
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*$", text)
     if not m: return None
     s = m.group(1).replace(",", ".")
     try: return float(s)
@@ -625,10 +699,8 @@ def _num_from_text_m(text: str):
 
 def _num_from_text_m2(text: str):
     if not text: return None
-    # "450 m2", "450 m²", "450m2"
     m = re.search(r"(\d{1,3}(?:[ \u00A0\u202F.]?\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s*m(?:2|²)\b", text, flags=re.I)
     if not m:
-        # niekedy len číslo bez jednotky
         m = re.search(r"(\d{2,5})(?!\d)", text)
     if not m: return None
     s = m.group(1)
@@ -637,18 +709,10 @@ def _num_from_text_m2(text: str):
     except: return None
 
 def extract_features_pairs(soup: BeautifulSoup) -> list[dict]:
-    """
-    Vytiahne kľúč-hodnota páry z rôznych štruktúr (tabuľky, <dl>, zoznamy).
-    Výstup: [{"key": "...", "value": "..."}, ...]
-    """
     pairs = []
-
     def push(k, v):
         k = clean_spaces(k or ""); v = clean_spaces(v or "")
-        if k and v:
-            pairs.append({"key": k, "value": v})
-
-    # Tabuľky <table>
+        if k and v: pairs.append({"key": k, "value": v})
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             cells = tr.find_all(["th","td"])
@@ -656,22 +720,15 @@ def extract_features_pairs(soup: BeautifulSoup) -> list[dict]:
                 k = cells[0].get_text(" ", strip=True)
                 v = cells[1].get_text(" ", strip=True)
                 push(k, v)
-
-    # Definičné zoznamy <dl><dt><dd>
     for dl in soup.find_all("dl"):
         dts = dl.find_all("dt")
         dds = dl.find_all("dd")
         for dt, dd in zip(dts, dds):
             push(dt.get_text(" ", strip=True), dd.get_text(" ", strip=True))
-
-    # Zoznamy s dvojbodkou v texte
     for li in soup.find_all("li"):
         t = clean_spaces(li.get_text(" ", strip=True))
         if ":" in t and 3 < len(t) <= 200:
-            k, v = t.split(":", 1)
-            push(k, v)
-
-    # Páry s "label/value" v divoch/spanoch
+            k, v = t.split(":", 1); push(k, v)
     for row in soup.select("[class*='row'], [class*='item'], [class*='property'], [class*='attribute']"):
         lbl = None; val = None
         lab = row.find(attrs={"class": re.compile(r"(label|name|title)", re.I)})
@@ -679,8 +736,6 @@ def extract_features_pairs(soup: BeautifulSoup) -> list[dict]:
         valn = row.find(attrs={"class": re.compile(r"(value|data|content)", re.I)})
         if valn: val = valn.get_text(" ", strip=True)
         if lbl and val: push(lbl, val)
-
-    # Odstráň možné UI šumy
     cleaned = []
     for p in pairs:
         k = norm_txt(p["key"])
@@ -690,9 +745,6 @@ def extract_features_pairs(soup: BeautifulSoup) -> list[dict]:
     return cleaned
 
 def normalize_features(pairs: list[dict]) -> dict:
-    """
-    Premapuje voľný text kľúčov na štandardizované polia + parsuje čísla.
-    """
     out = {
         "land_area_m2": None,
         "builtup_area_m2": None,
@@ -707,74 +759,51 @@ def normalize_features(pairs: list[dict]) -> dict:
         "heating": None,
         "rooms_count": None,
     }
-
     def key_is(k: str, *needles):
         nk = norm_txt(k)
         return any(n in nk for n in needles)
-
     for p in pairs:
         k, v = p.get("key",""), p.get("value","")
-        nk = norm_txt(k)
-
-        # Plochy
-        if key_is(k, "vymera pozemku", "rozloha pozemku", "plocha pozemku", "pozemok", "celkova plocha pozemku"):
+        if key_is(k, "vymera pozemku","rozloha pozemku","plocha pozemku","pozemok","celkova plocha pozemku"):
             val = _num_from_text_m2(v)
             if val: out["land_area_m2"] = val; continue
-
         if key_is(k, "zastavana plocha"):
             val = _num_from_text_m2(v)
             if val: out["builtup_area_m2"] = val; continue
-
-        # niektorí uvádzajú úžitkovú/podlahovú plochu – to je skôr area_m2, ale ak builtup chýba, nedáme to sem
-        # ponecháme iba ako potenciálny doplnok v parse_detail, kde doplníme area_m2 ak chýba.
-
-        # Šírka pozemku
-        if key_is(k, "sirka pozemku", "sirka"):
+        if key_is(k, "sirka pozemku","sirka"):
             val = _num_from_text_m(v)
             if val: out["plot_width_m"] = val; continue
-
-        # Orientácia
         if key_is(k, "orientacia"):
             out["orientation"] = v; continue
-
-        # Vlastníctvo
-        if key_is(k, "vlastnictvo", "vlastnik"):
+        if key_is(k, "vlastnictvo","vlastnik"):
             out["ownership"] = v; continue
-
-        # Terén
-        if key_is(k, "teren", "sklon"):
+        if key_is(k, "teren","sklon"):
             out["terrain"] = v; continue
-
-        # Inžinierske siete
-        if key_is(k, "voda", "pripojka vody", "vodovod"):
+        if key_is(k, "voda","pripojka vody","vodovod"):
             out["water"] = v; continue
-        if key_is(k, "elektrina", "elektro", "elektr"):
+        if key_is(k, "elektrina","elektro","elektr"):
             out["electricity"] = v; continue
         if key_is(k, "plyn"):
             out["gas"] = v; continue
-        if key_is(k, "kanalizacia", "odpad", "splask"):
+        if key_is(k, "kanalizacia","odpad","splask"):
             out["waste"] = v; continue
-
-        # Kúrenie
-        if key_is(k, "kurenie", "vykurovanie"):
+        if key_is(k, "kurenie","vykurovanie"):
             out["heating"] = v; continue
-
-        # Počet izieb (ak nebude v adrese)
-        if key_is(k, "pocet izieb", "izby", "izieb"):
+        if key_is(k, "pocet izieb","izby","izieb"):
             m = re.search(r"\d+", v)
             if m:
                 try: out["rooms_count"] = int(m.group(0))
                 except: pass
-            continue
-
-    # Vyčistenie None hodnôt (ponecháme None; BQ schema to zvládne)
-    return {k: v for k, v in out.items()}
+    return out
 
 # ----------------- Detail parser -----------------
 
 def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint: str = None) -> dict:
-    r = get(session, url); r.raise_for_status()
-    html = r.text; soup = BeautifulSoup(html, "html.parser")
+    html = fetch_html_with_fallback(url, session)
+    if not html or len(html) < 500:
+        raise RuntimeError(f"empty/short HTML for {url}")
+
+    soup = BeautifulSoup(html, "html.parser")
 
     listing_id = None
     m = re.search(r"Číslo\s+inzerátu\s*:\s*([A-Za-z0-9_-]+)", html)
@@ -786,7 +815,6 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
     title = None; h1 = soup.find("h1")
     if h1: title = clean_spaces(h1.get_text(" "))
 
-    # adresa (orientačný text okolo H1)
     raw_address = None
     if h1:
         nxt = h1.find_next()
@@ -802,7 +830,6 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
             if ("okres" in chunk.lower()) and len(chunk) < 220:
                 raw_address = clean_spaces(chunk); break
 
-    # cena
     price_eur = price_from_jsonld(soup) or price_from_meta(soup) or price_from_text(soup, h1)
     price_note = None
     if price_eur is None:
@@ -815,20 +842,16 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
         with open(dbg, "w", encoding="utf-8") as f: f.write(html)
         if VERBOSE: print(f"[DEBUG] cena nezistená -> {dbg}", flush=True)
 
-    # POPIS – plný text
     description_text, _src = extract_description_block(soup)
 
-    # Vlastnosti
     pairs = extract_features_pairs(soup)
     features_json = json.dumps(pairs, ensure_ascii=False)
     norm_feats = normalize_features(pairs)
 
-    # Typ
     prop_type = type_hint or property_type_from_detail(soup, title=title, description_text=description_text, addr_text=raw_address)
     if not prop_type:
         prop_type = fallback_type_from_text(raw_address, title, description_text, url) or None
 
-    # Lokalita
     addr_info = extract_from_address(raw_address)
     obec = most_specific_obec(raw_address, title, description_text) or "Liptovský Mikuláš"
     street = addr_info.get("street_or_locality")
@@ -837,44 +860,31 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
         if s_norm in LM_OBCE_NORM or s_norm == norm_txt(obec):
             street = None
 
-    # Ak v „features“ existuje úžitková/podlahová plocha a chýba area_m2 z adresy → doplň
     if addr_info.get("area_m2") is None:
-        # hľadaj "Úžitková plocha" alebo "Podlahová plocha" medzi pármi
         for p in pairs:
             nk = norm_txt(p.get("key",""))
-            if any(x in nk for x in ("uzitkova plocha", "podlahova plocha", "obyvarna plocha", "celkova podlahova plocha")):
+            if any(x in nk for x in ("uzitkova plocha","podlahova plocha","obyvarna plocha","celkova podlahova plocha")):
                 val = _num_from_text_m2(p.get("value",""))
                 if val:
                     addr_info["area_m2"] = val
                     break
 
     return {
-        # KEYS
         "listing_id": listing_id,
         "pk": (listing_id or url),
         "url": url,
-
-        # LOKALITA
         "obec": obec,
         "street_or_locality": street,
-
-        # CENA
         "price_eur": _nan_to_none(price_eur),
         "price_note": (price_note or None),
-
-        # PARAMETRE
         "title": title,
         "property_type": prop_type,
         "rooms": addr_info.get("rooms"),
         "area_m2": addr_info.get("area_m2"),
         "condition": addr_info.get("condition"),
-
-        # POPIS/VLASTNOSTI
         "description_text": description_text,
         "features_json": features_json,
         **norm_feats,
-
-        # META
         "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -882,21 +892,15 @@ def parse_detail(session: requests.Session, url: str, seq_in_run: int, type_hint
 
 def load_master_xlsx(path: str) -> pd.DataFrame:
     cols = [
-        # KEYS
         "seq_global","listing_id","pk","url",
-        # LOKALITA
         "obec","street_or_locality",
-        # CENA
         "price_eur","price_note","price_status",
         "price_first_eur","price_first_note","price_first_date",
         "price_last_change_date","price_changes_count","price_history",
-        # PARAMETRE
         "title","property_type","rooms","area_m2","condition",
-        # POPIS/VLASTNOSTI
         "description_text","features_json",
         "land_area_m2","builtup_area_m2","plot_width_m","orientation","ownership",
         "terrain","water","electricity","gas","waste","heating","rooms_count",
-        # META
         "first_seen","last_seen","days_listed","active","inactive_since","scraped_at",
     ]
     if os.path.exists(path):
@@ -919,7 +923,6 @@ def load_master_xlsx(path: str) -> pd.DataFrame:
                 hist = load_history_from_cell(r.get("price_history"))
                 fixed.append(json.dumps(sanitize_history(hist), ensure_ascii=False, allow_nan=False))
             df["price_history"] = fixed
-        # finálny výber stĺpcov
         return df[[c for c in cols]]
     return pd.DataFrame(columns=cols)
 
@@ -1033,14 +1036,12 @@ def upload_to_bigquery(master: pd.DataFrame, df_today: pd.DataFrame):
         {"name":"scraped_at","type":"STRING"},
     ]
 
-    # DAILY (iba dnešné videné)
     d = df_today.copy()
     if not d.empty:
         d["batch_ts"] = pd.Timestamp.utcnow()
     daily_schema = [s for s in master_schema if s["name"] not in ("seq_global","days_listed","active","inactive_since")]
     daily_schema += [{"name":"batch_ts","type":"TIMESTAMP"}]
 
-    # Upload
     pandas_gbq.to_gbq(
         m, f"{dataset}.listings_master", project_id=project_id,
         if_exists="replace", table_schema=master_schema, location=location, progress_bar=False
@@ -1103,7 +1104,7 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
                 print("[DEBUG] 0 linkov na prvej stránke – skontroluj DEBUG HTML.", flush=True)
             break
 
-        # jemný type-hint z LIST karty
+        # type-hint z list karty
         try:
             soup = BeautifulSoup(html, "html.parser")
             mapping = {}
@@ -1145,7 +1146,7 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
                 rec = parse_detail(s, url, seq_in_run=idx, type_hint=type_hint)
             except Exception as e:
                 if VERBOSE:
-                    print(f"[ERROR] detail fail {url} -> {e}", flush=True)
+                    print(f"Error:  detail fail {url} -> {e}", flush=True)
                 continue
 
             pk = rec.get("pk") or url
@@ -1225,7 +1226,7 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
     except Exception:
         snap = master.copy()
 
-    # --- GARANCIA UNIKÁTNEHO PK (bez duplicít v rámci behu) ---
+    # GARANCIA UNIKÁTNEHO PK
     if "pk" in master.columns:
         master = master.drop_duplicates(subset=["pk"], keep="last")
     if "pk" in snap.columns:
@@ -1238,11 +1239,14 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
         print(f"✅ Uložený master:   {MASTER_XLSX}", flush=True)
         print(f"✅ Uložený snapshot: {SNAPSHOT_XLSX}", flush=True)
 
-    # upload do BQ (v2) – bez images_urls_daily
+    # upload do BQ
     upload_to_bigquery(
         master.drop(columns=["seen_today"], errors="ignore"),
         snap.drop(columns=["seen_today"], errors="ignore"),
     )
+
+    # vypni playwright ak bol spustený
+    _pw_stop()
 
 if __name__ == "__main__":
     crawl_to_excel()
