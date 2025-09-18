@@ -2,14 +2,15 @@
 """
 Real-estate scraper -> Excel (master + denné snapshoty) + popis + vlastnosti
 
-ANTI-BOT FIXES:
+ANTI-BOT FIXES (UPDATED):
 - Propagácia Referer z list stránky do detailov.
-- Realistické browser hlavičky (sec-ch-ua*, sec-fetch-*).
-- Exponenciálny backoff a detailné HTTP logy.
-- Playwright fallback: otvorí list → klik na link → načítanie detailu (cookie flow).
-- Jemné spomalenie medzi requestami.
+- Realistické browser hlavičky (sec-ch-ua*, sec-fetch-*) – dynamické podľa UA.
+- Exponenciálny backoff a detailné HTTP logy (vrátane headers pri 500).
+- Playwright fallback: otvorí list → klik na link → načítanie detailu (cookie flow) – vylepšené čakania a interakcie.
+- Jemné spomalenie medzi requestami – zvýšené pauzy.
 
 Pozn.: Ak chceš fallback vypnúť, nastav USE_PLAYWRIGHT_FALLBACK=false v env.
+Proxy: Nastav PROXY_URL=http://your_proxy:port v env pre rotáciu IP.
 """
 
 import os, re, time, json, random, math, unicodedata
@@ -33,16 +34,19 @@ BQ_LOCATION     = os.getenv("BQ_LOCATION", "EU")
 # Playwright fallback (ak je dostupný v prostredí)
 USE_PLAYWRIGHT_FALLBACK = os.getenv("USE_PLAYWRIGHT_FALLBACK", "true").lower() == "true"
 
+# Proxy support (optional)
+PROXY_URL = os.getenv("PROXY_URL", None)
+
 # ----------------- Nastavenia -----------------
 
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj"
 
 MAX_PAGES = 1                 # koľko strán výsledkov prejsť
-MAX_LINKS_PER_PAGE = 12       # maximum unikátnych inzerátov z 1 stránky
+MAX_LINKS_PER_PAGE = 3       # maximum unikátnych inzerátov z 1 stránky
 MAX_LISTINGS_TOTAL = None     # celkový strop (None = bez limitu)
 
-REQ_TIMEOUT = 25
-PAUSE = (1.8, 3.8)            # jemné spomalenie kvôli bot ochrane
+REQ_TIMEOUT = 30  # Zvýšené na 30s pre pomalšie načítavanie
+PAUSE = (2.5, 5.0)  # Zvýšené pauzy kvôli bot ochrane
 VERBOSE = True
 PROGRESS_EVERY = 1
 
@@ -119,10 +123,10 @@ def most_specific_obec(*texts) -> str | None:
 # ----------------- HTTP -----------------
 
 UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit(537.36) (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit(537.36) (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
 ]
 ACCEPT_LANGS = [
     "sk-SK,sk;q=0.9,cs-CZ;q=0.8,en-US;q=0.7,en;q=0.6",
@@ -131,21 +135,25 @@ ACCEPT_LANGS = [
 ]
 
 def rand_headers(extra=None, referer=None):
+    ua = random.choice(UAS)
     h = {
-        "User-Agent": random.choice(UAS),
+        "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": random.choice(ACCEPT_LANGS),
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Upgrade-Insecure-Requests": "1",
-        # modern Chrome-ish hints
+        # modern Chrome-ish hints – dynamické podľa UA
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Dest": "document",
-        "sec-ch-ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
     }
+    if "Chrome" in ua:
+        h["sec-ch-ua"] = '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"'
+    elif "Safari" in ua:
+        h["sec-ch-ua"] = '"Apple WebKit";v="605", "Chromium";v="128", "Safari";v="128"'
     if referer:
         h["Referer"] = referer
     else:
@@ -164,6 +172,16 @@ def new_session():
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     s.mount("https://", adapter); s.mount("http://", adapter)
+    
+    # Proxy setup
+    if PROXY_URL:
+        proxies = {
+            "http": PROXY_URL,
+            "https": PROXY_URL,
+        }
+        s.proxies.update(proxies)
+        if VERBOSE: print(f"[PROXY] Používa sa proxy: {PROXY_URL}", flush=True)
+    
     return s
 
 def sleep_a_bit():
@@ -189,6 +207,12 @@ def get(session: requests.Session, url: str, extra_headers=None, referer=None) -
         dt = time.perf_counter() - t0
         text_len = len(r.text or "")
         print(f"[HTTP] {attempt}/{tries} {r.status_code} {url} in {dt:.2f}s len={text_len}", flush=True)
+        
+        # Detailné logovanie pri chybách
+        if r.status_code == 500:
+            print(f"[ERROR 500] Headers: {dict(r.headers)}", flush=True)
+            print(f"[ERROR 500] Content preview: {r.text[:1000]}", flush=True)
+        
         last = r
         if r.status_code in (429,500,502,503,504):
             if attempt < tries:
@@ -216,7 +240,10 @@ def _pw_start():
     if _pw["ready"]: return
     from playwright.sync_api import sync_playwright
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+    launch_args = ["--no-sandbox"]
+    if PROXY_URL:
+        launch_args.append(f"--proxy-server={PROXY_URL}")
+    browser = pw.chromium.launch(headless=True, args=launch_args)
     ctx = browser.new_context(locale="sk-SK", user_agent=random.choice(UAS))
     page = ctx.new_page()
     _pw.update({"ready": True, "playwright": pw, "browser": browser, "context": ctx, "page": page})
@@ -243,7 +270,7 @@ def fetch_html_with_fallback(url: str, session: requests.Session, referer: str |
             # 1) ak máme referer/list stránku – otvoríme ju (kvôli cookies a eventom)
             if referer:
                 try:
-                    page.goto(referer, wait_until="domcontentloaded", timeout=30000)
+                    page.goto(referer, wait_until="networkidle", timeout=40000)  # Vylepšené čakanie
                     # cookie banner
                     try:
                         btn = page.get_by_role("button", name=re.compile("Súhlasím|Prijať|Accept|I agree", re.I))
@@ -251,7 +278,10 @@ def fetch_html_with_fallback(url: str, session: requests.Session, referer: str |
                             btn.first.click(timeout=2000)
                     except Exception:
                         pass
-                    page.wait_for_timeout(400)
+                    page.wait_for_timeout(500)  # Zvýšené čakanie
+                    # Simuluj pohyb myši
+                    page.mouse.move(random.randint(100, 500), random.randint(100, 500))
+                    page.wait_for_timeout(300)
                     # pokus nájsť konkrétny <a href=...> a kliknúť
                     sel_href = url
                     try:
@@ -266,16 +296,18 @@ def fetch_html_with_fallback(url: str, session: requests.Session, referer: str |
                     except Exception:
                         pass
                     try:
-                        page.locator(f"a[href='{sel_href}']").first.click(timeout=2000)
-                        page.wait_for_load_state("domcontentloaded", timeout=30000)
+                        page.locator(f"a[href='{sel_href}']").first.click(timeout=3000)  # Zvýšený timeout
+                        page.wait_for_load_state("networkidle", timeout=40000)  # Vylepšené čakanie
+                        # Čakanie na kľúčové elementy
+                        page.wait_for_selector("h1, [class*='price'], [class*='description']", timeout=10000)
                     except Exception:
                         # fallback: priamy goto na detail (už s cookies)
-                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        page.goto(url, wait_until="networkidle", timeout=40000)
                 except Exception:
                     # ak sa list nepodarí, skús priamo detail
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.goto(url, wait_until="networkidle", timeout=40000)
             else:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.goto(url, wait_until="networkidle", timeout=40000)
 
             # jemný scroll aby sa DOM doplnil
             last_h = -1
@@ -284,7 +316,7 @@ def fetch_html_with_fallback(url: str, session: requests.Session, referer: str |
                     page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
                 except Exception:
                     pass
-                page.wait_for_timeout(350)
+                page.wait_for_timeout(500)  # Zvýšené čakanie
                 try:
                     h = page.evaluate("document.body.scrollHeight")
                 except Exception:
@@ -294,6 +326,7 @@ def fetch_html_with_fallback(url: str, session: requests.Session, referer: str |
 
             html = page.content()
             if html and len(html) > 1000:
+                print(f"[PW] Fallback úspešný pre {url}, len={len(html)}, cookies: {len(_pw['context'].cookies())}", flush=True)
                 return html
         except Exception as ee:
             print(f"[PW] fallback error for {url}: {ee}", flush=True)
@@ -329,6 +362,8 @@ def extract_detail_links(html: str, page_url: str, limit: int | None) -> list:
                 unique_urls.append(abs_url)
             if limit is not None and len(unique_urls) >= limit:
                 break
+    if VERBOSE:
+        print(f"[DEBUG] Extracted links: {unique_urls[:3]}...", flush=True)  # Log prvých 3
     return unique_urls
 
 # ----------------- Základné util -----------------
@@ -1118,6 +1153,9 @@ def crawl_to_excel(base_url: str = BASE_URL, max_pages: int = MAX_PAGES,
                    max_links_per_page: int | None = MAX_LINKS_PER_PAGE,
                    max_listings_total: int | None = MAX_LISTINGS_TOTAL):
     s = new_session()
+
+    # Explicitne načítaj cookies z base URL
+    s.get(BASE_URL, headers=rand_headers(), timeout=REQ_TIMEOUT)
 
     master = load_master_xlsx(MASTER_XLSX)
     if master.empty:
