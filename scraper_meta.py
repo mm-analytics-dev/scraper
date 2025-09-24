@@ -41,8 +41,8 @@ PROXY_URL = os.getenv("PROXY_URL", None)
 
 BASE_URL = "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj"
 
-MAX_PAGES = 1                 # koľko strán výsledkov prejsť
-MAX_LINKS_PER_PAGE = 3       # maximum unikátnych inzerátov z 1 stránky
+MAX_PAGES = 40                 # koľko strán výsledkov prejsť
+MAX_LINKS_PER_PAGE = 100       # maximum unikátnych inzerátov z 1 stránky
 MAX_LISTINGS_TOTAL = None     # celkový strop (None = bez limitu)
 
 REQ_TIMEOUT = 30  # Zvýšené na 30s pre pomalšie načítavanie
