@@ -2,8 +2,8 @@ name: Pipeline v2 (meta → GPS → images)
 
 on:
   schedule:
-    - cron: '22 18 * * *'   # 20:15 Europe/Bratislava počas letného času (CEST)
-    - cron: '22 19 * * *'   # 20:15 Europe/Bratislava počas zimného času (CET)
+    - cron: '15 18 * * *'   # 20:15 Europe/Bratislava počas letného času (CEST)
+    - cron: '15 19 * * *'   # 20:15 Europe/Bratislava počas zimného času (CET)
   workflow_dispatch:
 
 jobs:
