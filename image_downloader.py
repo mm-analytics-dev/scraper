@@ -41,8 +41,8 @@ from google.api_core.exceptions import NotFound as GCPNotFound
 # ---------- Konštanty / ENV ----------
 BASE_URL = os.getenv("BASE_URL", "https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj")
 
-MAX_PAGES = int(os.getenv("MAX_PAGES", "2"))
-MAX_PER_PAGE = int(os.getenv("MAX_PER_PAGE", "4"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "40"))
+MAX_PER_PAGE = int(os.getenv("MAX_PER_PAGE", "100"))
 IMAGES_MAX_PER_LISTING = int(os.getenv("IMAGES_MAX_PER_LISTING", "60"))
 
 PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "").strip()
