@@ -18,8 +18,8 @@ ENV (vyžadované):
 
 Konfigurácia (ENV s defaultami):
   BASE_URL=https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj
-  MAX_PAGES=2
-  MAX_PER_PAGE=4
+  MAX_PAGES=40
+  MAX_PER_PAGE=100
   IMAGES_MAX_PER_LISTING=60
   BQ_TABLE=images_pk_gcs
   BATCH_DATE=YYYYMMDD (voliteľné, inak UTC today)
