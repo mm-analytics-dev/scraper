@@ -2,8 +2,8 @@ name: Pipeline v2 (meta → GPS → images)
 
 on:
   schedule:
-    - cron: '15 18 * * *'   # 20:15 Europe/Bratislava počas letného času (CEST)
-    - cron: '15 19 * * *'   # 20:15 Europe/Bratislava počas zimného času (CET)
+    - cron: '22 18 * * *'   # 20:15 Europe/Bratislava počas letného času (CEST)
+    - cron: '22 19 * * *'   # 20:15 Europe/Bratislava počas zimného času (CET)
   workflow_dispatch:
 
 jobs:
@@ -147,4 +147,13 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # pošli obi
+          # pošli obidva dataset secrety (downloader vie urobiť fallback sám)
+          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
+          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+          # limity
+          IMAGES_LOOKBACK_DAYS: '3'
+          IMAGES_MAX_LISTINGS: '15'
+          IMAGES_MAX_PER_LISTING: '60'
+        run: python image_downloader.py
