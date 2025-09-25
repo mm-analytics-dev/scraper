@@ -2,9 +2,9 @@ name: Pipeline v2 (meta → GPS → images)
 
 on:
   schedule:
-    # 20:15 Europe/Bratislava: CEST aj CET (kvôli DST robíme dva crony)
-    - cron: '15 18 * * *'   # 20:15 CEST
-    - cron: '15 19 * * *'   # 20:15 CET
+    # 16:10 Europe/Bratislava: CEST aj CET (kvôli DST používame dva crony; GitHub Actions beží v UTC)
+    - cron: '10 14 * * *'   # 16:10 CEST (UTC+2)
+    - cron: '10 15 * * *'   # 16:10 CET  (UTC+1)
   workflow_dispatch:
 
 jobs:
@@ -17,12 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Guard: spusti iba ak je v Europe/Bratislava presne 20:15
-      - name: Guard run at 20:15 Europe/Bratislava
+      # Guard: spusti iba ak je v Europe/Bratislava presne 16:10
+      - name: Guard run at 16:10 Europe/Bratislava
         run: |
           now=$(TZ=Europe/Bratislava date +'%H:%M')
-          if [ "$now" != "20:15" ]; then
-            echo "Not 20:15 Europe/Bratislava (now: $now). Exiting."
+          if [ "$now" != "16:10" ]; then
+            echo "Not 16:10 Europe/Bratislava (now: $now). Exiting."
             exit 0
           fi
 
@@ -49,7 +49,6 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # pošli obidva dataset secrety + fallback
           BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
           BQ_DATASET: ${{ secrets.BQ_DATASET_V2 != '' && secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
@@ -69,11 +68,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Guard run at 20:15 Europe/Bratislava
+      # Guard: spusti iba ak je v Europe/Bratislava presne 16:10
+      - name: Guard run at 16:10 Europe/Bratislava
         run: |
           now=$(TZ=Europe/Bratislava date +'%H:%M')
-          if [ "$now" != "20:15" ]; then
-            echo "Not 20:15 Europe/Bratislava (now: $now). Exiting."
+          if [ "$now" != "16:10" ]; then
+            echo "Not 16:10 Europe/Bratislava (now: $now). Exiting."
             exit 0
           fi
 
@@ -114,11 +114,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Guard run at 20:15 Europe/Bratislava
+      # Guard: spusti iba ak je v Europe/Bratislava presne 16:10
+      - name: Guard run at 16:10 Europe/Bratislava
         run: |
           now=$(TZ=Europe/Bratislava date +'%H:%M')
-          if [ "$now" != "20:15" ]; then
-            echo "Not 20:15 Europe/Bratislava (now: $now). Exiting."
+          if [ "$now" != "16:10" ]; then
+            echo "Not 16:10 Europe/Bratislava (now: $now). Exiting."
             exit 0
           fi
 
@@ -145,7 +146,6 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # dataset (downloader používa BQ_DATASET)
           BQ_DATASET: ${{ secrets.BQ_DATASET_V2 != '' && secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
@@ -153,8 +153,4 @@ jobs:
           MAX_PAGES: '40'
           MAX_PER_PAGE: '100'
           IMAGES_MAX_PER_LISTING: '60'
-          # BASE_URL (voliteľne prepíš)
-          # BASE_URL: 'https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj'
-          # BQ_TABLE (voliteľne prepíš)
-          # BQ_TABLE: 'images_pk_gcs'
         run: python image_downloader.py
