@@ -2,8 +2,9 @@ name: Pipeline v2 (meta → GPS → images)
 
 on:
   schedule:
-    - cron: '15 18 * * *'   # 20:15 Europe/Bratislava počas letného času (CEST)
-    - cron: '15 19 * * *'   # 20:15 Europe/Bratislava počas zimného času (CET)
+    # 20:15 Europe/Bratislava: CEST aj CET (kvôli DST robíme dva crony)
+    - cron: '15 18 * * *'   # 20:15 CEST
+    - cron: '15 19 * * *'   # 20:15 CET
   workflow_dispatch:
 
 jobs:
@@ -34,7 +35,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas openpyxl \
                       pandas-gbq google-cloud-bigquery pyarrow db-dtypes \
-                      playwright
+                      playwright httpx
           python -m playwright install --with-deps chromium
 
       - name: Write service account key
@@ -55,7 +56,6 @@ jobs:
           BQ_ENABLE: ${{ secrets.BQ_ENABLE || 'true' }}
           SAVE_EXCEL: ${{ secrets.SAVE_EXCEL || 'false' }}
           WORKSPACE_HOME: ${{ github.workspace }}
-          # pre scraper_meta fallback cez Playwright
           USE_PLAYWRIGHT_FALLBACK: 'true'
         run: python scraper_meta.py
 
@@ -69,7 +69,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Guard: spusti iba ak je v Europe/Bratislava presne 20:15
       - name: Guard run at 20:15 Europe/Bratislava
         run: |
           now=$(TZ=Europe/Bratislava date +'%H:%M')
@@ -85,8 +84,8 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas pandas-gbq google-cloud-bigquery pyarrow db-dtypes
-          pip install playwright
+          pip install pandas pandas-gbq google-cloud-bigquery pyarrow db-dtypes \
+                      playwright httpx
           python -m playwright install --with-deps chromium
 
       - name: Write service account key
@@ -115,7 +114,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Guard: spusti iba ak je v Europe/Bratislava presne 20:15
       - name: Guard run at 20:15 Europe/Bratislava
         run: |
           now=$(TZ=Europe/Bratislava date +'%H:%M')
@@ -133,7 +131,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas \
                       google-cloud-storage google-cloud-bigquery pyarrow db-dtypes \
-                      playwright
+                      playwright httpx
           python -m playwright install --with-deps chromium
 
       - name: Write service account key
@@ -147,13 +145,16 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          # pošli obidva dataset secrety (downloader vie urobiť fallback sám)
-          BQ_DATASET_V2: ${{ secrets.BQ_DATASET_V2 }}
-          BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          # dataset (downloader používa BQ_DATASET)
+          BQ_DATASET: ${{ secrets.BQ_DATASET_V2 != '' && secrets.BQ_DATASET_V2 || secrets.BQ_DATASET }}
           BQ_LOCATION: ${{ secrets.BQ_LOCATION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
           # limity
-          IMAGES_LOOKBACK_DAYS: '3'
-          IMAGES_MAX_LISTINGS: '15'
+          MAX_PAGES: '40'
+          MAX_PER_PAGE: '100'
           IMAGES_MAX_PER_LISTING: '60'
+          # BASE_URL (voliteľne prepíš)
+          # BASE_URL: 'https://www.nehnutelnosti.sk/vysledky/okres-liptovsky-mikulas/predaj'
+          # BQ_TABLE (voliteľne prepíš)
+          # BQ_TABLE: 'images_pk_gcs'
         run: python image_downloader.py
