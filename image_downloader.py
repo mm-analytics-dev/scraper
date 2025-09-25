@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Playwright -> GCS + BigQuery (1 tabuľka s mapou pk -> https_url)
+Playwright → GCS + BigQuery (1 tabuľka: pk -> gcs_url)
 
-Logika:
-- prejde výsledkovky s presným stránkovaním (N položiek z každej strany),
-- otvorí detail -> galériu -> lazy-load + klikanie na thumbnail,
-- odchytáva image response a ukladá ich, s deduplikáciou podľa (host+path) bez query,
-- upload priamo do GCS (images_v3/YYYYMMDD/<listing_id>/<NNN>.<ext>),
-- do BQ pridá jeden riadok na každý obrázok (pk, https_url, timestamps), bez duplicit.
+ZMENY / HARDENING:
+- Nová stránka (tab) pre každý listing → žiadne leaknuté event listenery.
+- goto_with_retries() s backoffom (ošetrený ERR_ABORTED).
+- Fallback na httpx, ak Playwright nedá resp.body() (No resource id / cache / preruš. odpoveď).
+- Kopíruje cookies + Referer do httpx requestu.
+- Cache busting cez hlavičky (Cache-Control: no-cache).
+- Priebežný flush do BQ po každom inzeráte.
+- Dedup na úrovni GCS path a (pk, gcs_url).
 
 ENV (vyžadované):
   GCP_PROJECT_ID
@@ -30,8 +32,10 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit
 from typing import Dict, Any, List, Set, Tuple
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from playwright._impl._errors import Error as PWError
 
 # ---------- GCP ----------
 from google.cloud import bigquery
@@ -51,6 +55,9 @@ LOCATION     = os.getenv("BQ_LOCATION", "EU").strip()
 BUCKET_NAME  = os.getenv("GCS_BUCKET", "").strip()
 BQ_TABLE     = os.getenv("BQ_TABLE", "images_pk_gcs").strip()
 
+if not PROJECT_ID or not DATASET or not BUCKET_NAME:
+    raise RuntimeError("Missing ENV: GCP_PROJECT_ID / BQ_DATASET / GCS_BUCKET")
+
 BATCH_DATE_ENV = os.getenv("BATCH_DATE", "").strip()
 def batch_yyyymmdd() -> str:
     if BATCH_DATE_ENV:
@@ -64,7 +71,12 @@ GCS_PREFIX = f"images_v3/{BATCH_YYYYMMDD}"
 
 # ---------- Selektory / regexy ----------
 DETAIL_ID_RE = re.compile(r"/detail/([^/]+)/")
-ALLOW_HOSTS = ("img.nehnutelnosti.sk", "img.unitedclassifieds.sk")
+ALLOW_HOSTS = (
+    "img.nehnutelnosti.sk",
+    "img.unitedclassifieds.sk",
+    # pridaj, ak sa objaví iná CDN:
+    # "images.nehnutelnosti.sk",
+)
 
 def listing_id_from_url(u: str) -> str | None:
     m = DETAIL_ID_RE.search(u or "")
@@ -88,9 +100,6 @@ def dedup_key(url: str) -> str:
     return f"{sp.netloc}{sp.path}"
 
 # ---------- GCP klienti ----------
-if not PROJECT_ID or not DATASET or not BUCKET_NAME:
-    raise RuntimeError("Missing ENV: GCP_PROJECT_ID / BQ_DATASET / GCS_BUCKET")
-
 bq = bigquery.Client(project=PROJECT_ID, location=LOCATION or None)
 gcs = storage.Client(project=PROJECT_ID)
 bucket = gcs.bucket(BUCKET_NAME)
@@ -124,7 +133,8 @@ async def fetch_existing_pairs_for_pks(pks: List[str]) -> Set[Tuple[str, str]]:
     """
     try:
         job_cfg = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("pks", "STRING", list(sorted(set(pks))))]
+            query_parameters=[bigquery.ArrayQueryParameter("pks", "STRING", list(sorted(set(pks))))],
+            priority=bigquery.QueryPriority.INTERACTIVE,
         )
         df = bq.query(sql, job_config=job_cfg, location=LOCATION or None).result().to_dataframe()
         return {(str(r["pk"]), str(r["gcs_url"])) for _, r in df.iterrows()}
@@ -157,15 +167,51 @@ async def bq_append_rows(rows: List[Dict[str, Any]]):
         row_ids=[None]*len(rows)
     )
     if errors:
-        # keď sa zopár duplicit prešmykne, BQ insert_rows_json to často zoberie aj s warningom
         print(f"[BQ] partial errors: {errors}")
     else:
         print(f"[BQ] inserted {len(rows)} rows into {table}")
 
-# ---------- Stránkovanie (max N z každej strany) ----------
+# ---------- Helpers: retry goto + httpx hlavičky/cookies ----------
+async def goto_with_retries(page, url: str, attempts: int = 3, wait: str = "domcontentloaded", referer: str | None = None):
+    last_err = None
+    for i in range(1, attempts+1):
+        try:
+            await page.goto(url, wait_until=wait, referer=referer, timeout=30000)
+            return True
+        except PWError as e:
+            msg = str(e)
+            last_err = e
+            # typicky: ERR_ABORTED alebo preruš. navigácia / detach frame
+            if "ERR_ABORTED" in msg or "Navigation failed because page was closed" in msg or "frame was detached" in msg:
+                await page.wait_for_timeout(1000 * i)
+                continue
+            await page.wait_for_timeout(1000 * i)
+    print(f"[WARN] goto failed for {url}: {last_err}")
+    return False
+
+async def build_httpx_headers_and_cookies(ctx, ua: str, referer: str | None) -> tuple[dict, dict]:
+    st = await ctx.storage_state()
+    cookies = {}
+    for c in st.get("cookies", []):
+        cookies[c["name"]] = c["value"]
+    headers = {
+        "User-Agent": ua,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "sk-SK,sk;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    if referer:
+        headers["Referer"] = referer
+    # niekedy pomôže:
+    headers["Origin"] = "https://www.nehnutelnosti.sk"
+    return headers, cookies
+
+# ---------- Zber linkov z výsledkovky ----------
 async def collect_detail_links(page, base_url: str, max_pages: int, max_per_page: int) -> List[str]:
     def lid_of(u: str):
-        m = DETAIL_ID_RE.search(u)
+        m = DETAIL_ID_RE.search(u or "")
         return m.group(1) if m else None
 
     all_links, seen_ids = [], set()
@@ -173,9 +219,11 @@ async def collect_detail_links(page, base_url: str, max_pages: int, max_per_page
     for p in range(1, max_pages + 1):
         target = base_url if p == 1 else f"{base_url}{'&' if '?' in base_url else '?'}page={p}"
         print(f"    - otváram {target}")
-        await page.goto(target, wait_until="domcontentloaded")
+        ok = await goto_with_retries(page, target, attempts=3, wait="domcontentloaded")
+        if not ok:
+            break
 
-        # cookies
+        # cookies banner
         try:
             btn = page.get_by_role("button", name=re.compile("Súhlasím|Prijať|Accept", re.I))
             if await btn.count() > 0:
@@ -222,146 +270,179 @@ async def scrape_to_gcs_bq():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         ctx = await browser.new_context(
             locale="sk-SK",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            user_agent=UA,
         )
-        page = await ctx.new_page()
+        # jedna stránka na listovanie
+        list_page = await ctx.new_page()
 
-        links = await collect_detail_links(page, BASE_URL, MAX_PAGES, MAX_PER_PAGE)
+        links = await collect_detail_links(list_page, BASE_URL, MAX_PAGES, MAX_PER_PAGE)
         if not links:
             print("[INFO] Žiadne detail linky.")
             await browser.close()
             return
 
-        # prednačítaj existujúce páry pre všetky PK
+        # načítaj existujúce páry pre zníženie duplicit
         pks = [listing_id_from_url(u) or u for u in links]
         existing_pairs = await fetch_existing_pairs_for_pks(pks)
 
         rows_to_insert: List[Dict[str, Any]] = []
 
-        for detail_url in links:
-            lid = listing_id_from_url(detail_url) or "NA"
-            pk = lid
-            folder_prefix = f"{GCS_PREFIX}/{lid}"
+        # httpx klient
+        base_headers, base_cookies = await build_httpx_headers_and_cookies(ctx, UA, referer=None)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as httpx_client:
 
-            # dedup set v jednom behu (host+path)
-            seen_keys: Set[str] = set()
-            saved = 0
-            idx = 1  # poradie v GCS priečinku
+            for detail_url in links:
+                lid = listing_id_from_url(detail_url) or "NA"
+                pk = lid
+                folder_prefix = f"{GCS_PREFIX}/{lid}"
 
-            print(f"[go] {detail_url}")
+                # izolovaná stránka pre listing
+                page = await ctx.new_page()
 
-            # zistíme URL galérie
-            await page.goto(detail_url, wait_until="domcontentloaded")
-            sd = BeautifulSoup(await page.content(), "html.parser")
-            a = sd.select_one('a[href*="/detail/galeria/foto/"]')
-            gallery_url = urljoin(detail_url, a.get("href")) if a else urljoin(detail_url, f"/detail/galeria/foto/{lid}")
-            print(f"     -> galéria: {gallery_url}")
+                seen_keys: Set[str] = set()
+                saved = 0
+                idx = 1
 
-            download_tasks = []
+                print(f"[go] {detail_url}")
 
-            async def handle_image_response(resp):
-                nonlocal saved, idx, seen_keys, rows_to_insert, existing_pairs
-                try:
-                    if resp.request.resource_type != "image":
-                        return
-                    u = resp.url
-                    sp = urlsplit(u)
-                    if not any(h in sp.netloc for h in ALLOW_HOSTS):
-                        return
-                    key = dedup_key(u)
-                    if key in seen_keys or saved >= IMAGES_MAX_PER_LISTING:
-                        return
+                ok = await goto_with_retries(page, detail_url, attempts=3, wait="domcontentloaded")
+                if not ok:
+                    await page.close()
+                    continue
 
-                    body = await resp.body()
-                    if not body or len(body) < 2000:
-                        return
+                # nájdi URL galérie
+                sd = BeautifulSoup(await page.content(), "html.parser")
+                a = sd.select_one('a[href*="/detail/galeria/foto/"]')
+                gallery_url = urljoin(detail_url, a.get("href")) if a else urljoin(detail_url, f"/detail/galeria/foto/{lid}")
+                print(f"     -> galéria: {gallery_url}")
 
-                    ext = file_ext_from_url_or_ct(u, resp.headers.get("content-type", ""))
-                    gcs_path = f"{folder_prefix}/{idx:03d}{ext}"
-                    https_url = f"https://storage.googleapis.com/{BUCKET_NAME}/{gcs_path}"
+                # priprav httpx hlavičky s refererom na detail
+                headers, cookies = await build_httpx_headers_and_cookies(ctx, UA, referer=detail_url)
 
-                    # GCS/BQ dedup
-                    if gcs_blob_exists(gcs_path):
-                        # už je v buckete – zapíš do BQ len ak chýba pár
-                        if (pk, https_url) not in existing_pairs:
-                            rows_to_insert.append({
-                                "pk": pk,
-                                "gcs_url": https_url,
-                                "downloaded_at": datetime.now(timezone.utc),
-                                "batch_date": datetime.strptime(BATCH_YYYYMMDD, "%Y%m%d").date(),
-                            })
-                            existing_pairs.add((pk, https_url))
+                download_tasks = []
+
+                async def handle_image_response(resp):
+                    nonlocal saved, idx, seen_keys, rows_to_insert, existing_pairs
+                    try:
+                        if resp.request.resource_type != "image":
+                            return
+                        u = resp.url
+                        sp = urlsplit(u)
+                        if not any(h in sp.netloc for h in ALLOW_HOSTS):
+                            return
+                        key = dedup_key(u)
+                        if key in seen_keys or saved >= IMAGES_MAX_PER_LISTING:
+                            return
+
+                        # 1) PW body()
+                        body = b""
+                        try:
+                            await resp.finished()
+                            body = await resp.body()
+                        except Exception:
+                            body = b""
+
+                        # 2) Fallback: httpx (rovnaké URL, cookies, referer)
+                        if (not body) or (len(body) < 2000):
+                            try:
+                                r = await httpx_client.get(u, headers=headers, cookies=cookies)
+                                if r.status_code == 200 and len(r.content) >= 2000:
+                                    body = r.content
+                                else:
+                                    return
+                            except Exception:
+                                return
+
+                        ext = file_ext_from_url_or_ct(u, resp.headers.get("content-type", ""))
+                        gcs_path = f"{folder_prefix}/{idx:03d}{ext}"
+                        https_url = f"https://storage.googleapis.com/{BUCKET_NAME}/{gcs_path}"
+
+                        # GCS/BQ dedup
+                        if gcs_blob_exists(gcs_path):
+                            if (pk, https_url) not in existing_pairs:
+                                rows_to_insert.append({
+                                    "pk": pk,
+                                    "gcs_url": https_url,
+                                    "downloaded_at": datetime.now(timezone.utc),
+                                    "batch_date": datetime.strptime(BATCH_YYYYMMDD, "%Y%m%d").date(),
+                                })
+                                existing_pairs.add((pk, https_url))
+                            seen_keys.add(key)
+                            idx += 1
+                            saved += 1
+                            return
+
+                        gcs_upload_bytes(gcs_path, body, content_type=resp.headers.get("content-type"))
+                        print(f"    [+] gs://{BUCKET_NAME}/{gcs_path}  <- {sp.path.split('/')[-1]}")
+                        rows_to_insert.append({
+                            "pk": pk,
+                            "gcs_url": https_url,
+                            "downloaded_at": datetime.now(timezone.utc),
+                            "batch_date": datetime.strptime(BATCH_YYYYMMDD, "%Y%m%d").date(),
+                        })
+                        existing_pairs.add((pk, https_url))
                         seen_keys.add(key)
                         idx += 1
                         saved += 1
-                        return
+                    except Exception as e:
+                        print(f"    [!] save-fail: {e}")
 
-                    # upload
-                    gcs_upload_bytes(gcs_path, body, content_type=resp.headers.get("content-type"))
-                    print(f"    [+] gs://{BUCKET_NAME}/{gcs_path}  <- {sp.path.split('/')[-1]}")
-                    rows_to_insert.append({
-                        "pk": pk,
-                        "gcs_url": https_url,
-                        "downloaded_at": datetime.now(timezone.utc),
-                        "batch_date": datetime.strptime(BATCH_YYYYMMDD, "%Y%m%d").date(),
-                    })
-                    existing_pairs.add((pk, https_url))
-                    seen_keys.add(key)
-                    idx += 1
-                    saved += 1
-                except Exception as e:
-                    print(f"    [!] save-fail: {e}")
+                def on_response(resp):
+                    download_tasks.append(asyncio.create_task(handle_image_response(resp)))
 
-            def on_response(resp):
-                download_tasks.append(asyncio.create_task(handle_image_response(resp)))
+                page.on("response", on_response)
 
-            page.on("response", on_response)
+                try:
+                    ok = await goto_with_retries(page, gallery_url, attempts=3, wait="domcontentloaded", referer=detail_url)
+                    if not ok:
+                        page.remove_listener("response", on_response)
+                        await page.close()
+                        continue
 
-            try:
-                # otvor galériu + lazy load
-                await page.goto(gallery_url, wait_until="domcontentloaded")
-                for _ in range(10):
-                    try:
-                        await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-                    except:
-                        pass
-                    await page.wait_for_timeout(600)
-
-                # klikaj na thumbnaily
-                thumbs = page.locator('img[alt*="foto_"]')
-                count = await thumbs.count()
-                if count == 0:
-                    thumbs = page.locator('.MuiGrid2-container img[alt*="foto_"]')
-                    count = await thumbs.count()
-                print(f"    [thumbnails] count={count}")
-
-                for i in range(count):
-                    if saved >= IMAGES_MAX_PER_LISTING:
-                        break
-                    try:
-                        await thumbs.nth(i).scroll_into_view_if_needed()
-                        await thumbs.nth(i).click(timeout=1800)
-                    except:
+                    # lazy scroll
+                    for _ in range(10):
                         try:
-                            await thumbs.nth(i).hover(timeout=1200)
+                            await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
                         except:
                             pass
-                    await page.wait_for_timeout(450)
+                        await page.wait_for_timeout(600)
 
-                if download_tasks:
-                    await asyncio.gather(*download_tasks)
-            finally:
-                page.remove_listener("response", on_response)
+                    # thumbnaily
+                    thumbs = page.locator('img[alt*="foto_"]')
+                    count = await thumbs.count()
+                    if count == 0:
+                        thumbs = page.locator('.MuiGrid2-container img[alt*="foto_"]')
+                        count = await thumbs.count()
+                    print(f"    [thumbnails] count={count}")
 
-            print(f"[OK] {pk} saved:{saved}\n")
-            # priebežný flush do BQ (po každom inzeráte)
-            if rows_to_insert:
-                await bq_append_rows(rows_to_insert)
-                rows_to_insert.clear()
+                    for i in range(count):
+                        if saved >= IMAGES_MAX_PER_LISTING:
+                            break
+                        try:
+                            await thumbs.nth(i).scroll_into_view_if_needed()
+                            await thumbs.nth(i).click(timeout=2000)
+                        except:
+                            try:
+                                await thumbs.nth(i).hover(timeout=1200)
+                            except:
+                                pass
+                        await page.wait_for_timeout(450)
 
-            time.sleep(random.uniform(0.2, 0.5))
+                    if download_tasks:
+                        await asyncio.gather(*download_tasks)
+                finally:
+                    page.remove_listener("response", on_response)
+                    await page.close()
+
+                print(f"[OK] {pk} saved:{saved}\n")
+                if rows_to_insert:
+                    await bq_append_rows(rows_to_insert)
+                    rows_to_insert.clear()
+
+                time.sleep(random.uniform(0.2, 0.5))
 
         await browser.close()
 
