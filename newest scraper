@@ -1,0 +1,452 @@
+# --- FAST COLAB SCRAPER: nehnutelnosti.sk (Liptovský Mikuláš) ---
+# property_type iba z TITULKY (fixnuté priority a podmienky), zvyšok kódu pôvodný
+!pip -q install playwright pandas openpyxl nest_asyncio >/dev/null
+!playwright install --with-deps >/dev/null
+
+import os, re, time, random, asyncio, unicodedata
+import nest_asyncio; nest_asyncio.apply()
+import pandas as pd
+from datetime import datetime, date
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+# ===================== KONFIG =====================
+BASE_URL         = "https://www.nehnutelnosti.sk/vysledky/liptovsky-mikulas/predaj"
+MAX_PAGES        = 2
+LIMIT_PER_PAGE   = 10
+MAX_CONCURRENCY  = 8
+HEADLESS         = True
+
+OUT_DIR      = "/content/nehnutelnosti"
+STAMP        = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUT_XLSX     = f"{OUT_DIR}/liptovsky_mikulas_{STAMP}.xlsx"
+MASTER_SEEN  = f"{OUT_DIR}/master_seen.xlsx"
+os.makedirs(OUT_DIR, exist_ok=True)
+# ===================================================
+
+# ---------- pomocné ----------
+def _squash_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def clean_text(s: str) -> str:
+    if not s: return ""
+    return _squash_spaces(s.replace("\xa0"," ").replace("\u202f"," "))
+
+def strip_diacritics(s: str) -> str:
+    if s is None: return ""
+    nfkd = unicodedata.normalize("NFKD", str(s))
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+def norm(s: str) -> str:
+    return _squash_spaces(strip_diacritics(s or "").lower())
+
+def human_pause(a=0.05, b=0.15):
+    time.sleep(a + random.random()*b)
+
+def extract_listing_id(detail_url: str) -> str:
+    m = re.search(r"/detail/([^/]+)/", detail_url)
+    if m: return m.group(1)
+    try:
+        parts = urlparse(detail_url).path.strip("/").split("/")
+        i = parts.index("detail")
+        return parts[i+1]
+    except: return ""
+
+def page_url(base: str, page_idx: int) -> str:
+    u = urlparse(base); q = parse_qs(u.query)
+    if page_idx > 1: q["page"] = [str(page_idx)]
+    else:            q.pop("page", None)
+    new_q = urlencode({k:(v[0] if isinstance(v,list) else v) for k,v in q.items()})
+    return urlunparse((u.scheme,u.netloc,u.path,u.params,new_q,u.fragment))
+
+# ---------- KLASIFIKÁCIA LEN Z TITULKY ----------
+def classify_property_type_from_title(title: str) -> str:
+    """
+    Prísne len podľa titulky. Priority:
+      1) Pozemky (pozemok/pozemky, záhrada, orná pôda, priemyselná...)
+      2) Rekreačné: chata/chalupa/chatka/záhradná chatka
+      3) Domy: rodinný dom, bungalov, vila, zrub, mobilný dom...
+      4) Špeci byty: garzónka/dvojgarzónka, apartmán, mezonet, loft
+      5) Byty s počtom izieb – LEN ak sa v titulke vyskytuje slovo „byt“
+         (aby '7 izbový RODINNÝ DOM' nebol byt)
+      6) Ak je v titulke „byt“, ale nevie sa počet → „Byt“
+    """
+    t = norm(title)
+
+    # --- 1) Pozemky (skôr ako čokoľvek iné) ---
+    if re.search(r"\bpozemk\w*\b", t) or "stavebn" in t:
+        if "zahrad" in t:                        return "Záhrada"
+        if "orn" in t and "poda" in t:           return "Orná pôda"
+        if "priemyseln" in t:                    return "Priemyselná zóna"
+        if "komercn" in t:                       return "Komerčná zóna"
+        if "rekreac" in t:                       return "Rekreačný pozemok"
+        if "bytov" in t and "vystavb" in t:      return "Pozemok pre bytovú výstavbu"
+        if "obc" in t and "vybavenost" in t:     return "Pozemok pre obč. vybavenosť"
+        if "les" in t:                           return "Lesy"
+        if "rybnik" in t or "vodn" in t:         return "Rybník, vodná plocha"
+        if "luka" in t or "pasienok" in t:       return "Lúka, pasienok"
+        if "chmelnic" in t or "vinic" in t:      return "Chmelnica, vinica"
+        if "sad" in t:                           return "Sad"
+        # generické „stavebný pozemok“ alebo len „pozemok“
+        return "Iný stavebný pozemok"
+
+    # --- 2) Rekreačné objekty ---
+    if re.search(r"\b(chata|chalup\w*|drevenic\w*|zrub)\b", t):      return "Chata, drevenica, zrub"
+    if re.search(r"\bzahradn\w*\s*chatk\w*\b", t):                   return "Záhradná chatka"
+    if re.search(r"\bchatk\w*\b", t):                                return "Chata, drevenica, zrub"
+
+    # --- 3) Domy ---
+    if re.search(r"\brodinn[ y]?\s*dom\b", t):                       return "Rodinný dom"
+    if re.search(r"\bbungalov\b", t):                                return "Bungalov"
+    if re.search(r"\bvila\b", t):                                    return "Rodinná vila"
+    if re.search(r"\bzrub\w*\b", t):                                 return "Zrubový dom"
+    if re.search(r"\bvidieck\w*\s*dom\b", t):                        return "Vidiecky dom"
+    if re.search(r"\bmobiln\w*\s*dom\b", t):                         return "Mobilný dom"
+    if re.search(r"\bhausbot\b", t):                                 return "Hausbót"
+    # fallback: samostatné „dom“
+    if re.search(r"\bdom\b", t):                                     return "Rodinný dom"
+
+    # --- 4) Špeci byty (nevyžadujú slovo „byt“) ---
+    if re.search(r"\bdvoj\s*garzon\w*\b", t):                        return "Dvojgarzónka"
+    if re.search(r"\bgarzon\w*\b", t):                               return "Garzónka"
+    if re.search(r"\bmezonet\w*\b", t):                              return "Mezonet"
+    if re.search(r"\bapartman\w*\b", t):                             return "Apartmán"
+    if re.search(r"\bloft\b", t):                                    return "Loft"
+
+    # --- 5) Byty s počtom izieb – iba ak titulka obsahuje BYT ---
+    if "byt" in t:
+        # 3i byt / byt 3i
+        m = re.search(r"\b([1-9])\s*[- ]?\s*i\b.*\bbyt\b", t) or re.search(r"\bbyt\b.*\b([1-9])\s*[- ]?\s*i\b", t)
+        if m:
+            n = int(m.group(1));  return "5 a viac izbový byt" if n >= 5 else f"{n} izbový byt"
+        # 3-izbový byt / 3 izb. byt (s explicitným 'byt')
+        m = re.search(r"\b([1-9])\s*[- ]?\s*izb\w*\s*byt\b", t) or re.search(r"\bbyt\b.*\b([1-9])\s*[- ]?\s*izb\w*\b", t)
+        if m:
+            n = int(m.group(1));  return "5 a viac izbový byt" if n >= 5 else f"{n} izbový byt"
+        # inak aspoň vieme, že je to byt
+        return "Byt"
+
+    # --- 6) Ostatné priestory/objekty ---
+    if re.search(r"\bgaraz\b", t):                                   return "Garáž"
+    if re.search(r"\bhotel|penzion\b", t):                           return "Hotel, penzión"
+    if re.search(r"\bobchod\w*\s*(objekt|priestor)\b", t):           return "Obchodné priestory"
+    if re.search(r"\brestaurac\w*\b", t):                            return "Reštauračné priestory"
+    if "kancel" in t:                                                return "Kancelárie, admin. priestory"
+    if "sklad" in t:                                                 return "Skladové priestory"
+    if "vyrobn" in t:                                                return "Výrobné priestory"
+    if "polyfunkc" in t:                                             return "Polyfunkčný objekt"
+    if "administrativ" in t:                                         return "Administratívny objekt"
+
+    return ""
+
+# ---------- reserved/sold z TITLE ----------
+def is_reserved_or_sold(title: str) -> bool:
+    t = norm(title)
+    patterns = [
+        r"\brezervovan[ye]?\b", r"\brezervac", r"\brezerv\w*\b",
+        r"\bpredan[ey]?\b", r"\bpredaj ukoncen", r"\bukonceny predaj\b",
+        r"\bvypredan\w*\b"
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+# ---------- Playwright helpers ----------
+async def enable_blocking(page):
+    async def handler(route):
+        r = route.request
+        if r.resource_type in {"image","media","font"}:
+            return await route.abort()
+        url = r.url
+        if any(x in url for x in ("googletagmanager","google-analytics","doubleclick",
+                                  "facebook","hotjar","sentry","mixpanel")):
+            return await route.abort()
+        await route.continue_()
+    await page.route("**/*", handler)
+
+async def collect_listing_urls(page) -> list:
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_timeout(300)
+    links = page.locator('a.MuiBox-root[href*="/detail/"]')
+    n = await links.count() if links else 0
+    urls, seen = [], set()
+    for i in range(n):
+        href = await links.nth(i).get_attribute("href")
+        if href and "/detail/" in href and href not in seen:
+            seen.add(href)
+            urls.append(href)
+        if LIMIT_PER_PAGE and len(urls) >= LIMIT_PER_PAGE:
+            break
+    return urls
+
+async def scrape_detail(context, url: str, tries: int = 2) -> dict:
+    """Detail: title, price, description, property_type (LEN z TITLE), reserved/sold."""
+    for attempt in range(1, tries+1):
+        page = await context.new_page()
+        await enable_blocking(page)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            human_pause()
+
+            # TITLE
+            title = ""
+            try:
+                t1 = page.locator('h1[data-test-id="text"]').first
+                if await t1.count():
+                    title = clean_text(await t1.inner_text())
+            except PWTimeout:
+                pass
+
+            # PRICE
+            price = ""
+            try:
+                price_el = page.locator('p.MuiTypography-h3[data-test-id="text"]').first
+                if await price_el.count():
+                    price = clean_text(await price_el.inner_text())
+            except PWTimeout:
+                pass
+
+            # DESCRIPTION (už nepotrebujeme na typ)
+            description = ""
+            try:
+                desc_el = page.locator("#detail-description")
+                if await desc_el.count():
+                    description = clean_text(await desc_el.inner_text())
+            except PWTimeout:
+                pass
+
+            prop_type = classify_property_type_from_title(title)
+
+            await page.close()
+            return {
+                "title": title,
+                "price": price,
+                "description": description,
+                "reserved_or_sold": "ano" if is_reserved_or_sold(title) else "nie",
+                "property_type": prop_type,
+            }
+        except Exception as e:
+            await page.close()
+            if attempt >= tries:
+                return {"title":"", "price":"", "description":f"__ERROR__: {e}",
+                        "reserved_or_sold":"nie","property_type":""}
+            await asyncio.sleep(0.3)
+
+async def process_details_parallel(context, urls: list, max_concurrency: int) -> list:
+    sem = asyncio.Semaphore(max_concurrency)
+    results = []
+    async def worker(u):
+        async with sem:
+            d = await scrape_detail(context, u)
+            row = {
+                "listing_id": extract_listing_id(u),
+                "url": u,
+                "property_type": d["property_type"],
+                "title": d["title"],
+                "price": d["price"],
+                "description": d["description"],
+                "reserved_or_sold": d["reserved_or_sold"],
+            }
+            print("OK:", row["listing_id"], "|", row["price"], "|", row["property_type"])
+            results.append(row)
+    await asyncio.gather(*[asyncio.create_task(worker(u)) for u in urls])
+    return results
+
+# ---------- first_seen register (legacy) ----------
+def load_master_seen(path: str) -> dict:
+    if os.path.exists(path):
+        try:
+            df = pd.read_excel(path)
+            return {str(r["listing_id"]): str(r["first_seen_date"]) for _, r in df.iterrows()}
+        except Exception:
+            return {}
+    return {}
+
+def update_master_seen(path: str, rows: list, existing: dict):
+    today = date.today().isoformat()
+    for r in rows:
+        lid = str(r["listing_id"])
+        r["first_seen_date"] = existing.get(lid, today)
+        existing.setdefault(lid, r["first_seen_date"])
+    out_df = pd.DataFrame([{"listing_id": k, "first_seen_date": v} for k,v in sorted(existing.items())])
+    out_df.to_excel(path, index=False)
+
+# ==================== TRACKING LAYER (XLSX) ====================
+TRACK_DIR = OUT_DIR
+DIM_PATH          = os.path.join(TRACK_DIR, "listings_dim.xlsx")
+FACT_DAY_DIR      = os.path.join(TRACK_DIR, "fact_daily")
+EVENTS_PATH       = os.path.join(TRACK_DIR, "listing_status_events.xlsx")
+PRICE_EVENTS_PATH = os.path.join(TRACK_DIR, "listing_price_events.xlsx")
+os.makedirs(FACT_DAY_DIR, exist_ok=True)
+
+def _today_str():
+    return date.today().isoformat()
+
+def _status_from_text(title: str, desc: str = "") -> str:
+    t = norm(title); d = norm(desc); txt = f"{t} {d}"
+    if re.search(r"\b(predan|predaj ukoncen|ukonceny predaj)\b", txt): return "sold"
+    if re.search(r"\brezervovan", txt):                                 return "reserved"
+    return "active"
+
+def _read_xlsx_safe(path: str, dtype=None, sheet_name=0):
+    if os.path.exists(path):
+        try:
+            return pd.read_excel(path, dtype=dtype, sheet_name=sheet_name)
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+def _write_xlsx(df: pd.DataFrame, path: str):
+    tmp = path + ".tmp.xlsx"
+    with pd.ExcelWriter(tmp, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+    os.replace(tmp, path)
+
+def _append_xlsx_unique(df_new: pd.DataFrame, path: str, keys: list):
+    df_old = _read_xlsx_safe(path)
+    if not df_old.empty:
+        merged = pd.concat([df_old, df_new], ignore_index=True)
+        merged.drop_duplicates(subset=keys, keep="last", inplace=True)
+    else:
+        merged = df_new.copy()
+    _write_xlsx(merged, path)
+    return merged
+
+def update_catalogs(df_today: pd.DataFrame):
+    today = _today_str()
+    if df_today.empty:
+        print("No rows today – nothing to update."); return
+
+    df_obs = pd.DataFrame({
+        "obs_date": today,
+        "listing_id": df_today["listing_id"].astype(str),
+        "status": [_status_from_text(t, d) for t, d in zip(df_today["title"].fillna(""), df_today["description"].fillna(""))],
+        "price": df_today["price"],
+        "property_type_observed": df_today["property_type"],
+        "reserved_or_sold_flag": df_today["reserved_or_sold"].fillna("nie"),
+        "title": df_today["title"].fillna(""),
+        "url": df_today["url"].fillna("")
+    })
+
+    FACT_TODAY_PATH = os.path.join(FACT_DAY_DIR, f"{today}.xlsx")
+    _append_xlsx_unique(df_obs, FACT_TODAY_PATH, keys=["obs_date","listing_id"])
+
+    dim_old = _read_xlsx_safe(DIM_PATH, dtype={"listing_id": str})
+    cols = ["listing_id","url","first_seen_date","last_seen_date","current_status","current_property_type","is_active","last_price"]
+    if dim_old.empty: dim_old = pd.DataFrame(columns=cols)
+    if "last_price" not in dim_old.columns: dim_old["last_price"] = None
+    dim_old.set_index("listing_id", inplace=True, drop=False)
+
+    seen_today = set(df_today["listing_id"].astype(str))
+    pre_status = dim_old["current_status"].copy()
+
+    today_status_map, price_map = {}, {}
+    for _, r in df_today.iterrows():
+        lid = str(r["listing_id"]); url = r.get("url",""); ptype = r.get("property_type","")
+        title = r.get("title",""); desc = r.get("description","")
+        status = _status_from_text(title, desc)
+        today_status_map[lid] = status
+        price_map[lid] = str(r.get("price","")).strip()
+        if lid not in dim_old.index:
+            dim_old.loc[lid, "listing_id"] = lid
+            dim_old.loc[lid, "url"] = url
+            dim_old.loc[lid, "first_seen_date"] = today
+            dim_old.loc[lid, "current_property_type"] = ptype
+            dim_old.loc[lid, "current_status"] = status
+            dim_old.loc[lid, "is_active"] = True
+        dim_old.loc[lid, "last_seen_date"] = today
+
+    events_old = _read_xlsx_safe(EVENTS_PATH)
+    if events_old.empty: events_old = pd.DataFrame(columns=["event_date","listing_id","from_status","to_status","cause"])
+    price_old = _read_xlsx_safe(PRICE_EVENTS_PATH)
+    if price_old.empty: price_old = pd.DataFrame(columns=["event_date","listing_id","old_price","new_price"])
+
+    events_new, price_events = [], []
+
+    for lid, new_status in today_status_map.items():
+        old_status = pre_status.get(lid, None)
+        if old_status != new_status and old_status is not None:
+            events_new.append({"event_date": today, "listing_id": lid, "from_status": old_status, "to_status": new_status, "cause": "text_change"})
+        dim_old.loc[lid, "current_status"] = new_status
+        dim_old.loc[lid, "is_active"] = (new_status != "sold")
+
+    for lid, new_price in price_map.items():
+        old_price = dim_old.loc[lid, "last_price"] if pd.notna(dim_old.loc[lid, "last_price"]) else None
+        if (old_price is not None) and (str(old_price) != new_price):
+            price_events.append({"event_date": today, "listing_id": lid, "old_price": old_price, "new_price": new_price})
+        dim_old.loc[lid, "last_price"] = new_price
+
+    previously_active = set(dim_old.loc[dim_old["is_active"]==True, "listing_id"].astype(str))
+    disappeared = previously_active - seen_today
+    for lid in disappeared:
+        prev_status = dim_old.loc[lid, "current_status"]
+        if prev_status not in ("sold", "disappeared"):
+            events_new.append({"event_date": today, "listing_id": lid, "from_status": prev_status, "to_status": "disappeared", "cause": "not_seen_today"})
+        dim_old.loc[lid, "current_status"] = "disappeared"
+        dim_old.loc[lid, "is_active"] = False
+
+    if events_new:  _append_xlsx_unique(pd.DataFrame(events_new), EVENTS_PATH, keys=["event_date","listing_id","to_status"])
+    if price_events:_append_xlsx_unique(pd.DataFrame(price_events), PRICE_EVENTS_PATH, keys=["event_date","listing_id"])
+
+    dim_out = dim_old.reset_index(drop=True)[["listing_id","url","first_seen_date","last_seen_date","current_status","current_property_type","is_active","last_price"]]
+    _write_xlsx(dim_out, DIM_PATH)
+
+    print(f"✅ DIM: {len(dim_out)} záznamov (path={DIM_PATH})")
+    print(f"✅ FACT (today): {FACT_TODAY_PATH}")
+    print(f"✅ EVENTS: {EVENTS_PATH} (+{len(events_new)}), PRICE_EVENTS: {PRICE_EVENTS_PATH} (+{len(price_events)})")
+
+# ---------- hlavný beh ----------
+async def main():
+    all_rows = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 768},
+        )
+        results_page = await context.new_page()
+        await enable_blocking(results_page)
+
+        page_idx = 1
+        while True:
+            url = page_url(BASE_URL, page_idx)
+            print(f"\n== Stránka {page_idx} → {url}")
+            await results_page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            human_pause()
+
+            urls = await collect_listing_urls(results_page)
+            print(f"Nájdených inzerátov (po limite): {len(urls)}")
+            if not urls:
+                print("⚪ Žiadne výsledky — končím.")
+                break
+
+            rows = await process_details_parallel(context, urls, MAX_CONCURRENCY)
+            all_rows.extend(rows)
+
+            if MAX_PAGES and page_idx >= MAX_PAGES:
+                print(f"🟡 Limit {MAX_PAGES} strán dosiahnutý.")
+                break
+
+            page_idx += 1
+            if page_idx > 500:
+                print("Poistka: 500+ strán — stop.")
+                break
+
+        await results_page.close()
+        await browser.close()
+
+    master = load_master_seen(MASTER_SEEN)
+    update_master_seen(MASTER_SEEN, all_rows, master)
+
+    df = pd.DataFrame(all_rows, columns=[
+        "listing_id","url","property_type","title","price","description","reserved_or_sold","first_seen_date"
+    ])
+    df.to_excel(OUT_XLSX, index=False)
+    print(f"\nHotovo. Uložené do: {OUT_XLSX}")
+    print(f"Master register (first_seen): {MASTER_SEEN}")
+
+    update_catalogs(df)
+
+# Spusti
+await main()
